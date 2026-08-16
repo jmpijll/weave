@@ -32,9 +32,29 @@ The stable verification command used by the deployment installer is:
 npm exec --yes --package=pnpm@10.13.1 -- pnpm verify
 ```
 
-The one-command self-hosting installer and Compose service skeleton are added
-by the deployment foundation. For this repository foundation, a clean clone
-can import and run the Node server entry point immediately after installation:
+## One-command installer and Compose skeleton
+
+The deployment foundation ships a strict, ordered-gate installer and a minimal
+Compose skeleton so a fresh machine can stand up an empty Weave:
+
+```sh
+node scripts/install.mjs
+```
+
+The installer is online-first and fail-closed. It runs, in order: a numeric
+Node `>=24.12.0` check, `npm` presence, `docker compose version`, `docker info`,
+the pinned bootstrap `npm exec --yes --package=pnpm@10.13.1 -- pnpm install`,
+`docker compose pull`, and only then `docker compose up -d`. Every failure
+before `up -d` names its failing prerequisite and states that offline
+installation is unsupported. It never depends on a system pnpm or Corepack.
+
+The Compose skeleton starts a `postgres:16-alpine` database (the Weave backing
+store) with a named `weave-data` volume and a `server` service built from the
+`Dockerfile`. The server entry point is currently a protocol stub that exits by
+design until a listener lands in M1+; postgres is the running empty Weave state.
+
+For this repository foundation, a clean clone can import and run the Node
+server entry point immediately after installation:
 
 ```sh
 git clone https://github.com/jmpijll/weave.git
