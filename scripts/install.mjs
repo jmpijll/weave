@@ -76,4 +76,8 @@ if (up.status !== 0) {
   console.error("[weave-install] docker compose up -d failed");
   process.exit(up.status ?? 1);
 }
-console.log("[weave-install] Weave is running (empty).");
+console.log(
+  "[weave-install] Compose startup completed. The server is currently a " +
+    "non-listening protocol stub (exits by design until M1+); postgres is the " +
+    "running empty Weave state.",
+);
