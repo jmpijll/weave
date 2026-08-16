@@ -28,6 +28,33 @@ for (const application of runtimeApplications) {
   const enumCheck = spawnSync(process.execPath, [fixture], { encoding: "utf8" });
   assert.notEqual(enumCheck.status, 0, `${application} must reject non-erasable enum syntax`);
   assert.match(enumCheck.stderr, /ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX/);
+
+  const fixtureSource = await readFile(fixture, "utf8");
+  assert.match(fixtureSource, /^enum /m);
+  assert.match(fixtureSource, /^namespace /m);
+  assert.match(fixtureSource, /constructor\(private readonly value: string\)/);
+
+  const tsc = resolve(
+    root,
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "tsc.cmd" : "tsc",
+  );
+  const compileCheck = spawnSync(
+    tsc,
+    ["--noEmit", "--pretty", "false", "-p", resolve(root, "apps", application, "fixtures/tsconfig.json")],
+    { encoding: "utf8" },
+  );
+  const diagnostics = `${compileCheck.stdout}\n${compileCheck.stderr}`;
+  assert.notEqual(
+    compileCheck.status,
+    0,
+    `${application} fixture must fail compilation with erasableSyntaxOnly enabled`,
+  );
+  assert.ok(
+    (diagnostics.match(/TS1294/g) ?? []).length >= 3,
+    `${application} fixture must report enum, namespace, and parameter-property diagnostics`,
+  );
 }
 
 console.log("runtime imports verified: server, daemon; client type import verified");

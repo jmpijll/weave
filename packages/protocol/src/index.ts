@@ -3,6 +3,24 @@ export const PROTOCOL_NAME = "weave" as const;
 export const PROTOCOL_VERSION = 1 as const;
 
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
+
+/**
+ * The parser must accept an unknown wire version so the handshake can refuse
+ * it explicitly instead of requiring a cast at the boundary.
+ */
+export type ParsedProtocolEnvelope<TType extends string, TPayload> = Omit<
+  ProtocolEnvelope<TType, TPayload>,
+  "protocolVersion"
+> & {
+  protocolVersion: number;
+};
+
+export function isSupportedProtocolVersion(
+  protocolVersion: number,
+): protocolVersion is ProtocolVersion {
+  return protocolVersion === PROTOCOL_VERSION;
+}
+
 export type HarnessName = "opencode" | "claude-code" | "codex";
 export type CredentialKind = "human" | "host" | "agent";
 export type MemberKind = "human" | "agent";
@@ -27,13 +45,24 @@ export interface Credential {
   authorizedByCredentialId?: string;
 }
 
-export interface Member {
-  id: string;
-  kind: MemberKind;
-  personId?: string;
-  agentId?: string;
-  communityId: string;
-}
+export type Member =
+  | {
+      id: string;
+      kind: "human";
+      personId: string;
+      agentId?: never;
+      communityId: string;
+    }
+  | {
+      id: string;
+      kind: "agent";
+      personId?: never;
+      agentId: string;
+      communityId: string;
+    };
+
+/* The discriminated union above keeps the SQL member_kind_target invariant at
+ * the TypeScript boundary too. */
 
 export interface Space {
   id: string;
@@ -71,6 +100,7 @@ export interface HarnessCapabilities {
   liveContextUsage: boolean;
   compactionEvents: boolean;
   interrupt: boolean;
+  globalSkillNames: string[];
 }
 
 export interface HostCapabilities {
@@ -120,7 +150,7 @@ export interface AgentSession {
 
 export interface ContextUsage {
   usedTokens: number;
-  maxTokens: number;
+  maxTokens?: number;
 }
 
 export interface Content {
@@ -258,3 +288,10 @@ export type WireMessage =
   | MessageAckMessage
   | ContentFetchMessage
   | ContentReplaceMessage;
+
+type ParseWireMessage<T> = T extends ProtocolEnvelope<infer TType, infer TPayload>
+  ? ParsedProtocolEnvelope<TType, TPayload>
+  : never;
+
+/** Wire messages after parsing, before protocol-version refusal. */
+export type ParsedWireMessage = ParseWireMessage<WireMessage>;
