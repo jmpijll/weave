@@ -79,12 +79,29 @@ console.log("[weave-install] oci image pull ok");
 // 8. Fresh-project preflight: this installer only starts an empty Weave and
 //    must never tear down an existing deployment. Resolve the Compose project
 //    name, then refuse loudly if any container or volume already exists for it.
+//    Containers are queried by the Compose project label directly so
+//    orphan/project-labelled state is found regardless of declared services.
+//    Both queries are status-checked; a failed query fails closed before any
+//    mutation.
 const projectName = resolveProjectName();
 const preflightContainers = run(
   "docker",
-  ["compose", "ps", "-a", "--format", "{{.Names}}"],
+  [
+    "ps",
+    "-a",
+    "--filter",
+    `label=com.docker.compose.project=${projectName}`,
+    "--format",
+    "{{.Names}}",
+  ],
   { stdio: "pipe" },
 );
+if (preflightContainers.status !== 0) {
+  fail(
+    "project preflight",
+    `docker ps -a (project label ${projectName}) failed; cannot verify a fresh project`,
+  );
+}
 const preflightVolumes = run(
   "docker",
   [
@@ -97,6 +114,12 @@ const preflightVolumes = run(
   ],
   { stdio: "pipe" },
 );
+if (preflightVolumes.status !== 0) {
+  fail(
+    "project preflight",
+    `docker volume ls (project label ${projectName}) failed; cannot verify a fresh project`,
+  );
+}
 const containers = preflightContainers.stdout.toString().trim().split("\n").filter(Boolean);
 const volumes = preflightVolumes.stdout.toString().trim().split("\n").filter(Boolean);
 if (containers.length > 0 || volumes.length > 0) {

@@ -13,7 +13,12 @@ export type ServerMessage = WireMessage;
 export const DEFAULT_PORT = 8080;
 
 export function createWeaveServer(): Server {
-  return createServer((_request, response) => {
+  return createServer((request, response) => {
+    if (request.url !== "/health") {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ status: "not_found" }));
+      return;
+    }
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ status: "ok", service: component.name }));
   });

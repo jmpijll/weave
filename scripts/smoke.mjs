@@ -113,6 +113,10 @@ try {
   assert.deepEqual(health, { status: "ok", service: "server" });
   console.log(`server /health verified on ephemeral port ${port}: ${JSON.stringify(health)}`);
 
+  const unknown = await fetch(`http://127.0.0.1:${port}/anything`);
+  assert.equal(unknown.status, 404, "non-/health paths must return 404");
+  console.log("server non-/health path correctly rejected with HTTP 404");
+
   assert.equal(exited, false, "server must still be running before termination");
   server.kill("SIGTERM");
   const result = await exitCode;
