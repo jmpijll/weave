@@ -156,10 +156,17 @@ if (waitHelp.status !== 0) {
   );
 }
 const helpText = `${waitHelp.stdout ?? ""}${waitHelp.stderr ?? ""}`;
-if (!helpText.includes("--wait") || !helpText.includes("--wait-timeout")) {
+// Each option must appear as its own standalone token at a whitespace or
+// line boundary. A plain substring check for "--wait" would also be satisfied
+// by the "--wait-timeout" token alone (and \b word boundaries match inside
+// "--wait-timeout" as well), letting a malformed/variant Compose help pass the
+// gate and reach a mutating invocation that rejects `--wait`.
+const hasStandaloneWait = /(?:^|\s)--wait(?:\s|$)/m.test(helpText);
+const hasWaitTimeoutOption = /(?:^|\s)--wait-timeout(?:\s|$)/m.test(helpText);
+if (!hasStandaloneWait || !hasWaitTimeoutOption) {
   fail(
     "compose up --wait capability",
-    "installed Compose does not advertise `up --wait --wait-timeout`; health-qualified startup is not possible",
+    "installed Compose does not advertise the standalone `up --wait` and `--wait-timeout` options; health-qualified startup is not possible",
   );
 }
 console.log("[weave-install] docker compose up --wait --wait-timeout capability confirmed");
