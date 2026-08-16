@@ -51,7 +51,37 @@ if (daemonCheck.status !== 0) {
 }
 console.log("[weave-install] docker daemon ok");
 
-// 5. Pinned pnpm bootstrap (registry required). Fails closed when the npm
+// 5. Health-wait capability gate (client-side, before any mutation). Success
+//    below depends on `docker compose up --wait`; validate the installed
+//    Compose client advertises it rather than silently relying on an arbitrary
+//    Compose-v2 version. Runs immediately after daemon reachability and before
+//    bootstrap, verify, image pull, and project preflight, so an unsupported
+//    client fails before any registry, image, container, or volume state is
+//    touched.
+const waitHelp = run("docker", ["compose", "up", "--help"], { stdio: "pipe" });
+if (waitHelp.status !== 0) {
+  fail(
+    "compose up --wait capability",
+    "docker compose up --help failed; cannot verify health-wait support",
+  );
+}
+const helpText = `${waitHelp.stdout ?? ""}${waitHelp.stderr ?? ""}`;
+// Each option must appear as its own standalone token at a whitespace or
+// line boundary. A plain substring check for "--wait" would also be satisfied
+// by the "--wait-timeout" token alone (and \b word boundaries match inside
+// "--wait-timeout" as well), letting a malformed/variant Compose help pass the
+// gate and reach a mutating invocation that rejects `--wait`.
+const hasStandaloneWait = /(?:^|\s)--wait(?:\s|$)/m.test(helpText);
+const hasWaitTimeoutOption = /(?:^|\s)--wait-timeout(?:\s|$)/m.test(helpText);
+if (!hasStandaloneWait || !hasWaitTimeoutOption) {
+  fail(
+    "compose up --wait capability",
+    "installed Compose does not advertise the standalone `up --wait` and `--wait-timeout` options; health-qualified startup is not possible",
+  );
+}
+console.log("[weave-install] docker compose up --wait --wait-timeout capability confirmed");
+
+// 6. Pinned pnpm bootstrap (registry required). Fails closed when the npm
 //    registry is unreachable, before any container, volume, or database state.
 const bootstrap = run(PINNED_PNPM[0], [...PINNED_PNPM.slice(1), "install"]);
 if (bootstrap.status !== 0) {
@@ -62,7 +92,7 @@ if (bootstrap.status !== 0) {
 }
 console.log("[weave-install] pnpm bootstrap ok");
 
-// 6. Repository verification gate: the canonical pinned `pnpm verify` command
+// 7. Repository verification gate: the canonical pinned `pnpm verify` command
 //    (CONTRIBUTING.md / README). Runs after bootstrap, before any image pull,
 //    so a failing or offline verification stops before Compose state exists.
 const verify = run(PINNED_PNPM[0], [...PINNED_PNPM.slice(1), "verify"]);
@@ -74,14 +104,14 @@ if (verify.status !== 0) {
 }
 console.log("[weave-install] pnpm verify ok");
 
-// 7. OCI image pull reachability, before any container is started.
+// 8. OCI image pull reachability, before any container is started.
 const pull = run("docker", ["compose", "pull"]);
 if (pull.status !== 0) {
   fail("oci image pull", "docker compose pull failed; the OCI registry is unreachable");
 }
 console.log("[weave-install] oci image pull ok");
 
-// 8. Fresh-project preflight: this installer only starts an empty Weave and
+// 9. Fresh-project preflight: this installer only starts an empty Weave and
 //    must never tear down an existing deployment. Resolve the Compose project
 //    name, then refuse loudly if any container or volume already exists for it.
 //    Containers are queried by the Compose project label directly so
@@ -143,33 +173,6 @@ if (containers.length > 0 || volumes.length > 0) {
   process.exit(1);
 }
 console.log(`[weave-install] project "${projectName}" preflight clean: no containers or volumes`);
-
-// 9. Health-wait capability gate (client-side, before any mutation). Success
-//    below depends on `docker compose up --wait`; validate the installed
-//    Compose client advertises it rather than silently relying on an arbitrary
-//    Compose-v2 version.
-const waitHelp = run("docker", ["compose", "up", "--help"], { stdio: "pipe" });
-if (waitHelp.status !== 0) {
-  fail(
-    "compose up --wait capability",
-    "docker compose up --help failed; cannot verify health-wait support",
-  );
-}
-const helpText = `${waitHelp.stdout ?? ""}${waitHelp.stderr ?? ""}`;
-// Each option must appear as its own standalone token at a whitespace or
-// line boundary. A plain substring check for "--wait" would also be satisfied
-// by the "--wait-timeout" token alone (and \b word boundaries match inside
-// "--wait-timeout" as well), letting a malformed/variant Compose help pass the
-// gate and reach a mutating invocation that rejects `--wait`.
-const hasStandaloneWait = /(?:^|\s)--wait(?:\s|$)/m.test(helpText);
-const hasWaitTimeoutOption = /(?:^|\s)--wait-timeout(?:\s|$)/m.test(helpText);
-if (!hasStandaloneWait || !hasWaitTimeoutOption) {
-  fail(
-    "compose up --wait capability",
-    "installed Compose does not advertise the standalone `up --wait` and `--wait-timeout` options; health-qualified startup is not possible",
-  );
-}
-console.log("[weave-install] docker compose up --wait --wait-timeout capability confirmed");
 
 // 10. Start the stack and wait for BOTH Compose health checks under the bounded
 //     timeout above. Detached `up` alone only starts containers; `--wait`
