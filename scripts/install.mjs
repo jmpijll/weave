@@ -3,6 +3,11 @@ import { spawnSync } from "node:child_process";
 const OFFLINE_MSG =
   "Offline installation is not supported by this release path.";
 const PINNED_PNPM = ["npm", "exec", "--yes", "--package=pnpm@10.13.1", "--", "pnpm"];
+// Bounded health wait: `docker compose up --wait` must observe both services
+// healthy within this many seconds or the install fails and rolls back. At
+// least ~2x the composed worst-case healthcheck budget (db ~100s, then server
+// ~110s after the db-healthy dependency) plus headroom.
+const HEALTH_WAIT_SECONDS = 300;
 
 function fail(prerequisite, detail) {
   console.error(`[weave-install] prerequisite failed: ${prerequisite}`);
@@ -139,12 +144,46 @@ if (containers.length > 0 || volumes.length > 0) {
 }
 console.log(`[weave-install] project "${projectName}" preflight clean: no containers or volumes`);
 
-// 9. Start the stack. If up/build fails after the clean preflight, roll back
-//    exactly this project (containers, volumes, orphans) and preserve the
-//    original failure; if the rollback itself fails, fail loudly.
-const up = run("docker", ["compose", "up", "-d"]);
+// 9. Health-wait capability gate (client-side, before any mutation). Success
+//    below depends on `docker compose up --wait`; validate the installed
+//    Compose client advertises it rather than silently relying on an arbitrary
+//    Compose-v2 version.
+const waitHelp = run("docker", ["compose", "up", "--help"], { stdio: "pipe" });
+if (waitHelp.status !== 0) {
+  fail(
+    "compose up --wait capability",
+    "docker compose up --help failed; cannot verify health-wait support",
+  );
+}
+const helpText = `${waitHelp.stdout ?? ""}${waitHelp.stderr ?? ""}`;
+if (!helpText.includes("--wait") || !helpText.includes("--wait-timeout")) {
+  fail(
+    "compose up --wait capability",
+    "installed Compose does not advertise `up --wait --wait-timeout`; health-qualified startup is not possible",
+  );
+}
+console.log("[weave-install] docker compose up --wait --wait-timeout capability confirmed");
+
+// 10. Start the stack and wait for BOTH Compose health checks under the bounded
+//     timeout above. Detached `up` alone only starts containers; `--wait`
+//     makes it exit 0 only after db and server have passed their health checks,
+//     so a crashed or unhealthy service (or a timeout) exits non-zero here and
+//     never reports false success. If up/build/health-wait fails after the clean
+//     preflight, roll back exactly this project (containers, volumes, orphans)
+//     and preserve the original failure; if the rollback itself fails, fail
+//     loudly. Success is claimed only when the health wait succeeds.
+const up = run("docker", [
+  "compose",
+  "up",
+  "-d",
+  "--wait",
+  "--wait-timeout",
+  String(HEALTH_WAIT_SECONDS),
+]);
 if (up.status !== 0) {
-  console.error("[weave-install] docker compose up -d failed; rolling back this fresh project");
+  console.error(
+    `[weave-install] docker compose up -d --wait --wait-timeout ${HEALTH_WAIT_SECONDS} failed (build, start, or health-wait timeout); rolling back this fresh project`,
+  );
   const rollback = run("docker", [
     "compose",
     "down",
@@ -163,8 +202,8 @@ if (up.status !== 0) {
   process.exit(up.status ?? 1);
 }
 console.log(
-  "[weave-install] Compose startup completed: db and a healthy long-running " +
-    "empty Weave server are up (liveness only, no product API).",
+  "[weave-install] Compose startup completed: db and the empty Weave server passed " +
+    `their health checks within ${HEALTH_WAIT_SECONDS}s (liveness only, no product API).`,
 );
 
 function resolveProjectName() {
