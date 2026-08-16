@@ -44,14 +44,23 @@ node scripts/install.mjs
 The installer is online-first and fail-closed. It runs, in order: a numeric
 Node `>=24.12.0` check, `npm` presence, `docker compose version`, `docker info`,
 the pinned bootstrap `npm exec --yes --package=pnpm@10.13.1 -- pnpm install`,
+the pinned verification gate `npm exec --yes --package=pnpm@10.13.1 -- pnpm verify`,
 `docker compose pull`, and only then `docker compose up -d`. Every failure
 before `up -d` names its failing prerequisite and states that offline
 installation is unsupported. It never depends on a system pnpm or Corepack.
 
+`up -d` is transactional for a fresh project. Before starting, the installer
+resolves the Compose project name and refuses if any containers or volumes
+already exist for it — it never tears down an existing deployment. If `up`
+or the image build fails after a clean preflight, it rolls back exactly the
+project with `docker compose down --volumes --remove-orphans`, preserves the
+original failure, and fails loudly if the rollback itself fails.
+
 The Compose skeleton starts a `postgres:16-alpine` database (the Weave backing
 store) with a named `weave-data` volume and a `server` service built from the
-`Dockerfile`. The server entry point is currently a protocol stub that exits by
-design until a listener lands in M1+; postgres is the running empty Weave state.
+`Dockerfile`. The server is a minimal long-running entry point exposing only a
+`/health` liveness endpoint (no product API, auth, or persistence), with a
+Compose healthcheck and `restart: unless-stopped`.
 
 For this repository foundation, a clean clone can import and run the Node
 server entry point immediately after installation:

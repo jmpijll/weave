@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 
 const OFFLINE_MSG =
   "Offline installation is not supported by this release path.";
+const PINNED_PNPM = ["npm", "exec", "--yes", "--package=pnpm@10.13.1", "--", "pnpm"];
 
 function fail(prerequisite, detail) {
   console.error(`[weave-install] prerequisite failed: ${prerequisite}`);
@@ -47,37 +48,114 @@ console.log("[weave-install] docker daemon ok");
 
 // 5. Pinned pnpm bootstrap (registry required). Fails closed when the npm
 //    registry is unreachable, before any container, volume, or database state.
-const bootstrap = run("npm", [
-  "exec",
-  "--yes",
-  "--package=pnpm@10.13.1",
-  "--",
-  "pnpm",
-  "install",
-]);
+const bootstrap = run(PINNED_PNPM[0], [...PINNED_PNPM.slice(1), "install"]);
 if (bootstrap.status !== 0) {
   fail(
     "pnpm bootstrap",
-    "npm exec --package=pnpm@10.13.1 failed; the npm registry is likely unreachable",
+    "npm exec --package=pnpm@10.13.1 -- pnpm install failed; the npm registry is likely unreachable",
   );
 }
 console.log("[weave-install] pnpm bootstrap ok");
 
-// 6. OCI image pull reachability, before any container is started.
+// 6. Repository verification gate: the canonical pinned `pnpm verify` command
+//    (CONTRIBUTING.md / README). Runs after bootstrap, before any image pull,
+//    so a failing or offline verification stops before Compose state exists.
+const verify = run(PINNED_PNPM[0], [...PINNED_PNPM.slice(1), "verify"]);
+if (verify.status !== 0) {
+  fail(
+    "pnpm verify",
+    "npm exec --package=pnpm@10.13.1 -- pnpm verify failed; repository checks did not pass",
+  );
+}
+console.log("[weave-install] pnpm verify ok");
+
+// 7. OCI image pull reachability, before any container is started.
 const pull = run("docker", ["compose", "pull"]);
 if (pull.status !== 0) {
   fail("oci image pull", "docker compose pull failed; the OCI registry is unreachable");
 }
 console.log("[weave-install] oci image pull ok");
 
-// 7. Only now start the stack.
+// 8. Fresh-project preflight: this installer only starts an empty Weave and
+//    must never tear down an existing deployment. Resolve the Compose project
+//    name, then refuse loudly if any container or volume already exists for it.
+const projectName = resolveProjectName();
+const preflightContainers = run(
+  "docker",
+  ["compose", "ps", "-a", "--format", "{{.Names}}"],
+  { stdio: "pipe" },
+);
+const preflightVolumes = run(
+  "docker",
+  [
+    "volume",
+    "ls",
+    "--filter",
+    `label=com.docker.compose.project=${projectName}`,
+    "--format",
+    "{{.Name}}",
+  ],
+  { stdio: "pipe" },
+);
+const containers = preflightContainers.stdout.toString().trim().split("\n").filter(Boolean);
+const volumes = preflightVolumes.stdout.toString().trim().split("\n").filter(Boolean);
+if (containers.length > 0 || volumes.length > 0) {
+  console.error(
+    `[weave-install] refusing to start: Compose project "${projectName}" already has state`,
+  );
+  if (containers.length > 0) {
+    console.error(`[weave-install]   existing containers: ${containers.join(", ")}`);
+  }
+  if (volumes.length > 0) {
+    console.error(`[weave-install]   existing volumes: ${volumes.join(", ")}`);
+  }
+  console.error(
+    "[weave-install] the installer never tears down an existing deployment; use a fresh project",
+  );
+  process.exit(1);
+}
+console.log(`[weave-install] project "${projectName}" preflight clean: no containers or volumes`);
+
+// 9. Start the stack. If up/build fails after the clean preflight, roll back
+//    exactly this project (containers, volumes, orphans) and preserve the
+//    original failure; if the rollback itself fails, fail loudly.
 const up = run("docker", ["compose", "up", "-d"]);
 if (up.status !== 0) {
-  console.error("[weave-install] docker compose up -d failed");
+  console.error("[weave-install] docker compose up -d failed; rolling back this fresh project");
+  const rollback = run("docker", [
+    "compose",
+    "down",
+    "--volumes",
+    "--remove-orphans",
+  ]);
+  if (rollback.status !== 0) {
+    console.error(
+      `[weave-install] rollback FAILED: docker compose down --volumes --remove-orphans exited ${rollback.status}`,
+    );
+    process.exit(rollback.status ?? 1);
+  }
+  console.error(
+    "[weave-install] rollback complete: project containers, volumes, and database state removed",
+  );
   process.exit(up.status ?? 1);
 }
 console.log(
-  "[weave-install] Compose startup completed. The server is currently a " +
-    "non-listening protocol stub (exits by design until M1+); postgres is the " +
-    "running empty Weave state.",
+  "[weave-install] Compose startup completed: db and a healthy long-running " +
+    "empty Weave server are up (liveness only, no product API).",
 );
+
+function resolveProjectName() {
+  const config = run("docker", ["compose", "config", "--format", "json"], { stdio: "pipe" });
+  if (config.status !== 0) {
+    fail("compose project name", "docker compose config failed");
+  }
+  try {
+    const parsed = JSON.parse(config.stdout.toString());
+    if (typeof parsed.name === "string" && parsed.name.length > 0) {
+      return parsed.name;
+    }
+    fail("compose project name", "docker compose config returned no name");
+  } catch {
+    fail("compose project name", "docker compose config output was not parseable JSON");
+  }
+}

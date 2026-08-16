@@ -13,7 +13,8 @@
     "spike:t3:codex": "node scripts/t3-codex-materializer.mjs"
   },
   "devDependencies": {
-    "typescript": "5.8.3"
+    "typescript": "5.8.3",
+    "@types/node": "24.13.3"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
