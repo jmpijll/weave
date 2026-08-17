@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -27,6 +29,9 @@ jobs:
 
       - name: Type-check all workspace consumers
         run: npm exec --yes --package=pnpm@10.13.1 -- pnpm check
+
+      - name: Run evidence retention policy
+        run: npm exec --yes --package=pnpm@10.13.1 -- pnpm evidence
 
       - name: Run workspace smoke tests
         run: npm exec --yes --package=pnpm@10.13.1 -- pnpm test
