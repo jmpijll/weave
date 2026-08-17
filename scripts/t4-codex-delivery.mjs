@@ -14,7 +14,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, realpathSync } from "node:fs";
 import { arch, platform, release, tmpdir, version } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -91,10 +91,40 @@ export function isWithinDirectory(ancestor, candidate) {
 }
 
 /**
- * Resolve the raw-artifact destination without touching the filesystem. Raw
+ * Resolve the physical path of `candidate` by following the deepest existing
+ * ancestor through realpath (allowing for yet-uncreated trailing components),
+ * so an existing symlink component cannot hide the real destination. Never
+ * creates or mutates anything; only reads canonical real paths.
+ */
+export function physicallyResolve(candidate) {
+  const absolute = resolve(candidate);
+  let current = absolute;
+  const remaining = [];
+  for (;;) {
+    try {
+      const real = realpathSync(current);
+      let physical = real;
+      for (let index = remaining.length - 1; index >= 0; index -= 1) {
+        physical = join(physical, remaining[index]);
+      }
+      return physical;
+    } catch (error) {
+      if (!(error && (error.code === "ENOENT" || error.code === "ENOTDIR"))) throw error;
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      remaining.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Resolve the raw-artifact destination without mutating the filesystem. Raw
  * captures default to the Git-ignored local-only scratch tree and public
  * evidence destinations fail closed before `main()` can create anything or
- * launch Codex.
+ * launch Codex. The lexical boundary check is reinforced by a physical one
+ * (through the deepest existing ancestor) so a pre-existing symlink inside
+ * the target path cannot redirect raw captures into `evidence/`.
  */
 export function resolveArtifactsDir(raw, opts = {}) {
   const root = resolve(opts.root ?? ROOT);
@@ -103,6 +133,12 @@ export function resolveArtifactsDir(raw, opts = {}) {
     ? join(root, ".scratch", "t4-codex", stamp())
     : resolve(root, raw);
   if (isWithinDirectory(evidenceRoot, target)) {
+    throw new Error(
+      `refusing to write raw artifacts into the public evidence tree (${evidenceRoot}); ` +
+        "use a Git-ignored local-only location such as .scratch/t4-codex/<timestamp>",
+    );
+  }
+  if (isWithinDirectory(physicallyResolve(evidenceRoot), physicallyResolve(target))) {
     throw new Error(
       `refusing to write raw artifacts into the public evidence tree (${evidenceRoot}); ` +
         "use a Git-ignored local-only location such as .scratch/t4-codex/<timestamp>",

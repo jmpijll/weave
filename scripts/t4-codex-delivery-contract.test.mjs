@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -124,6 +124,26 @@ test("rejects public T4 artifact destinations before filesystem mutation", async
     const sibling = join(root, "evidence-backup", "raw");
     assert.equal(resolveArtifactsDir(sibling, { root }), sibling);
     assert.equal(await pathExists(sibling), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects a symlink that redirects raw captures into evidence without creating a target", async () => {
+  const root = await mkdtemp(join(tmpdir(), "weave-t4-symlink-test-"));
+  try {
+    const scratch = join(root, ".scratch");
+    const evidence = join(root, "evidence");
+    await mkdir(scratch);
+    await mkdir(evidence);
+    await symlink("../evidence", join(scratch, "link"));
+
+    assert.throws(
+      () => resolveArtifactsDir(join(".scratch", "link", "t4"), { root }),
+      /public evidence tree/,
+    );
+    assert.equal(await pathExists(join(evidence, "t4")), false);
+    assert.equal(await pathExists(join(scratch, "link", "t4")), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
