@@ -8,14 +8,16 @@
  * directories, symbolic links or non-regular entries are permitted, and raw
  * host-specific capture artifacts never enter this branch.
  *
- * This module is the single source of truth for the summary schema, strict
- * validation, and deterministic report rendering. It is wired into `pnpm
- * test` / CI and covered by `scripts/evidence-contract.test.mjs`.
+ * This module is the single source of truth for the per-spike summary schemas,
+ * strict validation, and deterministic report rendering. It is wired into
+ * `pnpm test` / CI and covered by `scripts/evidence-contract.test.mjs`.
  *
- * Design rule (register Pass 31, Option A): the schema admits only booleans,
- * enumerated values, anchored versions, ISO timestamps, Git SHAs and SHA-256
- * digests. There is deliberately no free-form string field, so host paths,
- * hostnames, usernames, temp identifiers, prompts or raw environment content
+ * Each registered spike is a discriminated, fixed schema: the shared provenance
+ * fields plus a spike-specific, enumerated environment and an exact reviewed
+ * result-key set. The schema admits only booleans, enumerated values, anchored
+ * versions, ISO timestamps, Git SHAs and SHA-256 digests. There is deliberately
+ * no free-form string field, so host paths, hostnames, usernames, temp
+ * identifiers, context names, project names, prompts or raw environment content
  * cannot be expressed. Unknown keys, unknown values, omitted required keys,
  * anchored-version bypasses, extra files and unknown spikes all fail closed.
  */
@@ -39,7 +41,7 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{
 const LOGICAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
-/** Fixed, reviewed set of result keys (order is the report's row order). */
+/** Fixed, reviewed set of T3 result keys (order is the report's row order). */
 export const RESULT_KEYS = [
   "projectInstructionsLoad",
   "projectSkillVisible",
@@ -57,9 +59,21 @@ export const RESULT_KEYS = [
   "unsupportedHarnessLoudNoFallback",
 ];
 
+/** Fixed, reviewed set of T9 result keys (order is the report's row order). */
+export const T9_RESULT_KEYS = [
+  "nodeRuntimeConsistency",
+  "capabilityGate",
+  "bootstrapVerify",
+  "ociPullFailureZeroState",
+  "startFailureRollbackZeroState",
+  "dbServerHealth",
+  "health200",
+  "projectTeardownZeroState",
+];
+
 export const RESULT_STATUSES = ["PASS", "FAIL", "NEGATIVE", "UNAVAILABLE"];
 
-const RESULT_LABELS = {
+const T3_RESULT_LABELS = {
   projectInstructionsLoad: "Project instructions load",
   projectSkillVisible: "Project skill visible",
   globalCollisionFixture: "Pre-provisioned global collision fixture",
@@ -76,9 +90,15 @@ const RESULT_LABELS = {
   unsupportedHarnessLoudNoFallback: "Unsupported harness/version is loud, no fallback",
 };
 
-/** Registered spike slugs -> human-readable report titles. */
-export const SPIKE_TITLES = {
-  "t3-codex": "T3 — Codex Definition Materializer Spike",
+const T9_RESULT_LABELS = {
+  nodeRuntimeConsistency: "Node-runtime consistency (children resolve to pinned node, no unsupported-engine)",
+  capabilityGate: "compose up --wait capability gate before any mutation",
+  bootstrapVerify: "Pinned pnpm bootstrap and verify gate",
+  ociPullFailureZeroState: "OCI pull failure leaves zero containers and volumes",
+  startFailureRollbackZeroState: "Start-failure rollback leaves zero containers and volumes",
+  dbServerHealth: "db and server both report Healthy before exit",
+  health200: "GET /health returns HTTP 200",
+  projectTeardownZeroState: "Project teardown leaves zero containers and volumes",
 };
 
 const OS_VALUES = ["macos", "linux", "windows", "other"];
@@ -88,19 +108,100 @@ const ADAPTER_VALUES = [
   "claude-agent-acp",
   "opencode",
 ];
+const ARCH_VALUES = ["arm64", "amd64", "x86_64", "arm", "aarch64", "other"];
+const CONTAINER_RUNTIME_VALUES = [
+  "docker-desktop",
+  "docker-engine",
+  "podman",
+  "other",
+];
 const VISIBILITY_VALUES = ["not-published"];
 
-/** True when `slug` is a registered spike that may carry a public report. */
-export function isRegisteredSpike(slug) {
-  return (
-    typeof slug === "string" && Object.prototype.hasOwnProperty.call(SPIKE_TITLES, slug)
-  );
-}
+/**
+ * Per-spike definition. `environmentFields` is an ordered list of field specs
+ * used both for schema validation and report rendering. `environmentKeys` is
+ * the exact required set of environment keys for that spike.
+ */
+const SPIKE_DEFS = {
+  "t3-codex": {
+    title: "T3 — Codex Definition Materializer Spike",
+    environmentKeys: [
+      "os",
+      "osVersion",
+      "harness",
+      "harnessVersion",
+      "adapterName",
+      "adapterVersion",
+      "nodePinned",
+      "platform",
+      "nodePinnedMatched",
+    ],
+    envRows: [
+      { label: "Operating system", value: "os", detail: "osVersion" },
+      { label: "Harness", value: "harness", detail: "harnessVersion" },
+      { label: "Adapter", value: "adapterName", detail: "adapterVersion" },
+      { label: "Pinned Node", value: "nodePinned", matched: true },
+      { label: "Platform", value: "platform", detail: null },
+    ],
+    resultKeys: RESULT_KEYS,
+    resultLabels: T3_RESULT_LABELS,
+  },
+  "t9-installer": {
+    title: "T9 — Ordered-Gate Installer and Compose Skeleton Spike",
+    environmentKeys: [
+      "os",
+      "osVersion",
+      "arch",
+      "containerRuntime",
+      "dockerVersion",
+      "dockerDaemonVersion",
+      "composeVersion",
+      "nodePinned",
+      "platform",
+      "nodePinnedMatched",
+    ],
+    envRows: [
+      { label: "Operating system", value: "os", detail: "osVersion" },
+      { label: "Architecture", value: "arch", detail: null },
+      { label: "Container runtime", value: "containerRuntime", detail: null },
+      { label: "Docker client version", value: "dockerVersion", detail: null },
+      { label: "Docker daemon version", value: "dockerDaemonVersion", detail: null },
+      { label: "Docker Compose version", value: "composeVersion", detail: null },
+      { label: "Pinned Node", value: "nodePinned", matched: true },
+      { label: "Platform", value: "platform", detail: null },
+    ],
+    resultKeys: T9_RESULT_KEYS,
+    resultLabels: T9_RESULT_LABELS,
+  },
+};
+
+/** Registered spike slugs -> human-readable report titles. */
+export const SPIKE_TITLES = Object.fromEntries(
+  Object.entries(SPIKE_DEFS).map(([slug, def]) => [slug, def.title]),
+);
 
 /**
- * Leaf schema: each field maps to a validator function that returns true when
- * the value is an allowed, non-free-form shape.
+ * Environment field schema: each field maps to a validator function that
+ * returns true when the value is an allowed, non-free-form shape.
  */
+const envLeaf = {
+  os: (value) => typeof value === "string" && OS_VALUES.includes(value),
+  osVersion: (value) => typeof value === "string" && VERSION_RE.test(value),
+  harness: (value) => typeof value === "string" && HARNESS_VALUES.includes(value),
+  harnessVersion: (value) => typeof value === "string" && VERSION_RE.test(value),
+  adapterName: (value) => typeof value === "string" && ADAPTER_VALUES.includes(value),
+  adapterVersion: (value) => typeof value === "string" && VERSION_RE.test(value),
+  nodePinned: (value) => typeof value === "string" && VERSION_RE.test(value),
+  platform: (value) => typeof value === "string" && SLUG_RE.test(value),
+  nodePinnedMatched: (value) => typeof value === "boolean",
+  arch: (value) => typeof value === "string" && ARCH_VALUES.includes(value),
+  containerRuntime: (value) =>
+    typeof value === "string" && CONTAINER_RUNTIME_VALUES.includes(value),
+  dockerVersion: (value) => typeof value === "string" && VERSION_RE.test(value),
+  dockerDaemonVersion: (value) => typeof value === "string" && VERSION_RE.test(value),
+  composeVersion: (value) => typeof value === "string" && VERSION_RE.test(value),
+};
+
 const leaf = {
   boolean: (value) => typeof value === "boolean",
   version: (value) => typeof value === "string" && VERSION_RE.test(value),
@@ -113,57 +214,51 @@ const leaf = {
   status: (value) => RESULT_STATUSES.includes(value),
 };
 
-function inSet(set) {
-  return (value) => typeof value === "string" && set.includes(value);
+function envSchemaFor(spike) {
+  const def = SPIKE_DEFS[spike];
+  const keys = {};
+  for (const key of def.environmentKeys) {
+    keys[key] = envLeaf[key];
+  }
+  return { type: "object", keys };
 }
 
 /**
- * The reviewed top-level schema. Objects enforce an exact key set (no unknown
- * keys, no omitted required keys); leaf fields carry a single allowed shape
- * with no free-form strings.
+ * Build the discriminated schema for a spike: shared provenance keys plus the
+ * spike-specific environment and the exact reviewed result-key set.
  */
-export const SCHEMA = {
-  type: "object",
-  keys: {
-    schemaVersion: leaf.version,
-    spike: leaf.slug,
-    capturedAt: leaf.isoTimestamp,
-    publicProvenance: {
-      type: "object",
-      keys: { integrationCommit: leaf.gitSha },
-    },
-    localProvenance: {
-      type: "object",
-      keys: {
-        visibility: inSet(VISIBILITY_VALUES),
-        runnerSha: leaf.gitSha,
-        captureSha256: leaf.sha256,
-        recordId: leaf.logicalId,
+function schemaFor(spike) {
+  const def = SPIKE_DEFS[spike];
+  return {
+    type: "object",
+    keys: {
+      schemaVersion: leaf.version,
+      spike: leaf.slug,
+      capturedAt: leaf.isoTimestamp,
+      publicProvenance: {
+        type: "object",
+        keys: { integrationCommit: leaf.gitSha },
+      },
+      localProvenance: {
+        type: "object",
+        keys: {
+          visibility: { check: (value) => VISIBILITY_VALUES.includes(value) },
+          runnerSha: leaf.gitSha,
+          captureSha256: leaf.sha256,
+          recordId: leaf.logicalId,
+        },
+      },
+      environment: envSchemaFor(spike),
+      results: {
+        type: "object",
+        dynamic: true,
+        keyCheck: (key) => def.resultKeys.includes(key),
+        valueCheck: leaf.status,
+        requiredKeys: def.resultKeys,
       },
     },
-    environment: {
-      type: "object",
-      keys: {
-        os: inSet(OS_VALUES),
-        osVersion: leaf.version,
-        harness: inSet(HARNESS_VALUES),
-        harnessVersion: leaf.version,
-        adapterName: inSet(ADAPTER_VALUES),
-        adapterVersion: leaf.version,
-        nodePinned: leaf.version,
-        platform: leaf.slug,
-        nodePinnedMatched: leaf.boolean,
-      },
-    },
-    results: {
-      type: "object",
-      dynamic: true,
-      keyCheck: (key) => RESULT_KEYS.includes(key),
-      valueCheck: leaf.status,
-      requiredKeys: RESULT_KEYS,
-    },
-  },
-};
+  };
+}
 
 function validateObject(schemaNode, value, path, errors) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -207,6 +302,10 @@ function validateObject(schemaNode, value, path, errors) {
       if (!check(child)) {
         errors.push(`${path}.${key}: value is not an allowed shape`);
       }
+    } else if (check && typeof check === "object" && typeof check.check === "function") {
+      if (!check.check(child)) {
+        errors.push(`${path}.${key}: value is not an allowed shape`);
+      }
     }
   }
 }
@@ -217,7 +316,15 @@ function validateObject(schemaNode, value, path, errors) {
  */
 export function validateSummary(value) {
   const errors = [];
-  validateObject(SCHEMA, value, "$", errors);
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    errors.push("$: expected an object");
+    return errors;
+  }
+  if (typeof value.spike !== "string" || !Object.prototype.hasOwnProperty.call(SPIKE_DEFS, value.spike)) {
+    errors.push(`$: unknown or missing spike "${value.spike}" (fails closed)`);
+    return errors;
+  }
+  validateObject(schemaFor(value.spike), value, "$", errors);
   return errors;
 }
 
@@ -229,10 +336,14 @@ function titleFor(spike) {
   return title;
 }
 
-function negativeSummary(results) {
-  const negatives = RESULT_KEYS.filter((key) => results[key] === "NEGATIVE" || results[key] === "UNAVAILABLE");
+function negativeSummary(def, results) {
+  const negatives = def.resultKeys.filter(
+    (key) => results[key] === "NEGATIVE" || results[key] === "UNAVAILABLE",
+  );
   if (negatives.length === 0) return "";
-  const rows = negatives.map((key) => `- ${RESULT_LABELS[key]}: ${results[key]}`).join("\n");
+  const rows = negatives
+    .map((key) => `- ${def.resultLabels[key]}: ${results[key]}`)
+    .join("\n");
   return [
     "",
     "## Recorded negative-result conclusions",
@@ -246,11 +357,47 @@ function negativeSummary(results) {
   ].join("\n");
 }
 
+/** Ordered environment rows for the report table. */
+function environmentRows(def, environment) {
+  return def.envRows
+    .map((row) => {
+      const value = environment[row.value];
+      let detail = "-";
+      if (row.matched) {
+        detail = environment.nodePinnedMatched ? "matched" : "NOT matched";
+      } else if (row.detail) {
+        detail = environment[row.detail];
+      }
+      return `| ${row.label} | \`${value}\` | ${detail === "-" ? "-" : `\`${detail}\``} |`;
+    })
+    .join("\n");
+}
+
+function envLabel(key) {
+  const labels = {
+    os: "Operating system",
+    osVersion: "OS version",
+    harness: "Harness",
+    harnessVersion: "Harness version",
+    adapterName: "Adapter",
+    adapterVersion: "Adapter version",
+    nodePinned: "Pinned Node",
+    arch: "Architecture",
+    containerRuntime: "Container runtime",
+    dockerVersion: "Docker client version",
+    dockerDaemonVersion: "Docker daemon version",
+    composeVersion: "Docker Compose version",
+    platform: "Platform",
+  };
+  return labels[key] ?? key;
+}
+
 /**
  * Render REPORT.md deterministically from a validated summary. Only enumerated
  * + typed values are interpolated; no free-form host/path/environment content.
  */
 export function renderReport(summary) {
+  const def = SPIKE_DEFS[summary.spike];
   const { environment, publicProvenance, localProvenance, results, capturedAt } = summary;
   const title = titleFor(summary.spike);
   const created = capturedAt.slice(0, 10);
@@ -265,21 +412,18 @@ export function renderReport(summary) {
     `- \`localProvenance.recordId\` — \`${localProvenance.recordId}\`. Logical audit identifier; it is`,
     "  an equality anchor and never an absolute path.",
   ].join("\n");
-  const envRows = [
-    ["Operating system", environment.os, environment.osVersion],
-    ["Harness", environment.harness, environment.harnessVersion],
-    ["Adapter", environment.adapterName, environment.adapterVersion],
-    ["Pinned Node", environment.nodePinned, environment.nodePinnedMatched ? "matched" : "NOT matched"],
-    ["Platform", environment.platform, "-"],
-  ]
-    .map(([label, value, detail]) => `| ${label} | \`${value}\` | ${detail === "-" ? "-" : `\`${detail}\``} |`)
+  const resultRows = def.resultKeys
+    .map((key) => {
+      const status = results[key];
+      const disposition =
+        status === "NEGATIVE"
+          ? "recorded negative"
+          : status === "UNAVAILABLE"
+            ? "explicitly unavailable"
+            : status;
+      return `| ${def.resultLabels[key]} | ${status} | ${disposition} |`;
+    })
     .join("\n");
-  const resultRows = RESULT_KEYS.map((key) => {
-    const status = results[key];
-    const disposition =
-      status === "NEGATIVE" ? "recorded negative" : status === "UNAVAILABLE" ? "explicitly unavailable" : status;
-    return `| ${RESULT_LABELS[key]} | ${status} | ${disposition} |`;
-  }).join("\n");
 
   return [
     "---",
@@ -304,14 +448,14 @@ export function renderReport(summary) {
     "",
     "| Field | Value | Detail |",
     "|---|---|---|",
-    envRows,
+    environmentRows(def, environment),
     "",
     "## Results",
     "",
     "| Criterion | Status | Disposition |",
     "|---|---|---|",
     resultRows,
-    negativeSummary(results),
+    negativeSummary(def, results),
     "## Notes",
     "",
     "- A `NEGATIVE` or `UNAVAILABLE` result is a recorded conclusion, never a skipped row.",
@@ -319,4 +463,12 @@ export function renderReport(summary) {
     "  temp identifiers, prompts and raw environment content cannot appear in a public summary.",
     "",
   ].join("\n");
+}
+
+/** True when `slug` is a registered spike that may carry a public report. */
+export function isRegisteredSpike(slug) {
+  return (
+    typeof slug === "string" &&
+    Object.prototype.hasOwnProperty.call(SPIKE_DEFS, slug)
+  );
 }

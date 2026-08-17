@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { resolveArtifactsDir } from "./t3-codex-materializer.mjs";
-import { validateSummary, RESULT_KEYS } from "./evidence-contract.mjs";
+import { validateSummary, RESULT_KEYS, T9_RESULT_KEYS } from "./evidence-contract.mjs";
 import { verifyTree, verifyIntegrationCommitAncestors } from "./verify-evidence.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -393,9 +393,101 @@ async function testArtifactsDirRejectsPublicEvidence() {
   }
 }
 
+function validT9Summary(overrides = {}) {
+  const results = {};
+  for (const key of T9_RESULT_KEYS) results[key] = "PASS";
+  return {
+    schemaVersion: "1.0.0",
+    spike: "t9-installer",
+    capturedAt: "2026-08-17T20:40:00Z",
+    publicProvenance: { integrationCommit: "0".repeat(40) },
+    localProvenance: {
+      visibility: "not-published",
+      runnerSha: "1".repeat(40),
+      captureSha256: "2".repeat(64),
+      recordId: "weave-t9-installer-docker-desktop-2026-08-17",
+    },
+    environment: {
+      os: "macos",
+      osVersion: "26.5.2",
+      arch: "arm64",
+      containerRuntime: "docker-desktop",
+      dockerVersion: "29.6.2",
+      dockerDaemonVersion: "29.6.2",
+      composeVersion: "5.3.1",
+      nodePinned: "24.12.0",
+      platform: "darwin-arm64",
+      nodePinnedMatched: true,
+    },
+    results,
+    ...overrides,
+  };
+}
+
+async function testT9ConformantSummaryAccepted() {
+  const errors = validateSummary(validT9Summary());
+  assert.deepEqual(errors, [], "conformant t9-installer summary must validate clean");
+}
+
+async function testT9EnvironmentEnumerated() {
+  // t9-installer environment is fixed and enumerated: a foreign host path,
+  // context name, or free-form value must fail closed in any field.
+  const badContext = validT9Summary();
+  badContext.environment.containerRuntime = "my-custom-host";
+  assert.ok(
+    validateSummary(badContext).some((e) => e.includes("containerRuntime")),
+    "t9-installer containerRuntime must reject free-form value",
+  );
+
+  const badArch = validT9Summary();
+  badArch.environment.arch = "custom-arch";
+  assert.ok(
+    validateSummary(badArch).some((e) => e.includes("environment.arch")),
+    "t9-installer arch must reject unenumerated value",
+  );
+
+  const badNode = validT9Summary();
+  badNode.environment.nodePinned = "24.12.0-injected/../../etc/passwd";
+  assert.ok(
+    validateSummary(badNode).some((e) => e.includes("nodePinned")),
+    "t9-installer nodePinned must reject anchored-version bypass",
+  );
+
+  const badOs = validT9Summary();
+  badOs.environment.os = "/opt/weave/sandbox";
+  assert.ok(
+    validateSummary(badOs).some((e) => e.includes("environment.os")),
+    "t9-installer os must reject free-form value",
+  );
+}
+
+async function testT9ResultKeysFixed() {
+  // The exact reviewed result-key set is required; unknown or missing keys fail.
+  const unknown = validT9Summary();
+  unknown.results.madeUpInstallerResult = "PASS";
+  assert.ok(
+    validateSummary(unknown).some((e) => e.includes("madeUpInstallerResult")),
+    "t9-installer must reject an unknown result key",
+  );
+
+  const missing = validT9Summary();
+  delete missing.results.dbServerHealth;
+  assert.ok(
+    validateSummary(missing).some((e) => e.includes("dbServerHealth") && e.includes("missing")),
+    "t9-installer must reject a missing reviewed result key",
+  );
+
+  // A t3 result key must not be accepted inside a t9 summary and vice-versa.
+  const crossT3 = validT9Summary();
+  crossT3.results.nodePinExact = "PASS";
+  assert.ok(
+    validateSummary(crossT3).some((e) => e.includes("nodePinExact")),
+    "t9-installer must not accept t3-only result keys",
+  );
+}
+
 const tests = [
   testConformantSummaryAccepted,
-  testUnexpectedFile,
   testUnexpectedDirectory,
   testSymbolicLinkRejected,
   testSpikeDirectoryBoundToSummary,
@@ -409,6 +501,9 @@ const tests = [
   testUnsafeFreeFormValue,
   testReportRoundTripStable,
   testIntegrationCommitAncestor,
+  testT9ConformantSummaryAccepted,
+  testT9EnvironmentEnumerated,
+  testT9ResultKeysFixed,
 ];
 
 for (const test of tests) {

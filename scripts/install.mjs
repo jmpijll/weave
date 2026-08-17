@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { subprocessEnv } from "./node-runtime-env.mjs";
 
 const OFFLINE_MSG =
   "Offline installation is not supported by this release path.";
@@ -17,7 +18,7 @@ function fail(prerequisite, detail) {
 }
 
 function run(command, args, { stdio = "inherit" } = {}) {
-  return spawnSync(command, args, { stdio });
+  return spawnSync(command, args, { stdio, env: subprocessEnv() });
 }
 
 // 1. Node floor (numeric >=24.12.0; never lexical, never engines-reliant).
