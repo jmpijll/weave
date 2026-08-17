@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "1.0.0",
+  "spike": "t4-codex",
+  "capturedAt": "2026-08-17T16:06:15Z",
+  "publicProvenance": {
+    "integrationCommit": "c53f23862b82ce1946cd34aa51eca40c510d5dc0"
+  },
+  "localProvenance": {
+    "visibility": "not-published",
+    "runnerSha": "c53f23862b82ce1946cd34aa51eca40c510d5dc0",
+    "captureSha256": "749d510589400ad79afccac4a857fe8efacd72ba2315a978dd37469b6555aaad",
+    "recordId": "accepted-local-record"
+  },
+  "environment": {
+    "os": "macos",
+    "osVersion": "25.5.0",
+    "harness": "codex",
+    "harnessVersion": "0.145.0",
+    "adapterName": "@agentclientprotocol/codex-acp",
+    "adapterVersion": "1.1.7",
+    "nodePinned": "24.12.0",
+    "platform": "darwin-arm64",
+    "nodePinnedMatched": true
+  },
+  "results": {
+    "nodePinExact": "PASS",
+    "homeInheritedNoOverride": "PASS",
+    "authenticatedTurn": "PASS",
+    "nativeSteeringAdvertised": "PASS",
+    "inFlightBeforeOriginalCompletion": "PASS",
+    "originalTaskMarkerRetained": "PASS",
+    "injectedEventMarkerIncorporated": "PASS",
+    "midTurnDelivery": "PASS",
+    "typedConfigDiffAllowlisted": "PASS",
+    "acpProcessTreeExited": "PASS",
+    "noResidualListeners": "PASS",
+    "outsideRootRejected": "PASS",
+    "unsupportedHarnessLoudNoFallback": "PASS"
+  }
+}
