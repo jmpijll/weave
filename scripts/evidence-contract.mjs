@@ -40,7 +40,7 @@ const LOGICAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/;
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 /** Fixed, reviewed set of result keys (order is the report's row order). */
-export const RESULT_KEYS = [
+export const T3_RESULT_KEYS = [
   "projectInstructionsLoad",
   "projectSkillVisible",
   "globalCollisionFixture",
@@ -54,6 +54,26 @@ export const RESULT_KEYS = [
   "outsideRootRejected",
   "killAlphaBravoIsolated",
   "noResidualProcesses",
+  "unsupportedHarnessLoudNoFallback",
+];
+
+// Keep RESULT_KEYS as the established T3 export for existing callers. T4 is
+// discriminated by summary.spike and has its own exact reviewed key set.
+export const RESULT_KEYS = T3_RESULT_KEYS;
+
+export const T4_RESULT_KEYS = [
+  "nodePinExact",
+  "homeInheritedNoOverride",
+  "authenticatedTurn",
+  "nativeSteeringAdvertised",
+  "inFlightBeforeOriginalCompletion",
+  "originalTaskMarkerRetained",
+  "injectedEventMarkerIncorporated",
+  "midTurnDelivery",
+  "typedConfigDiffAllowlisted",
+  "acpProcessTreeExited",
+  "noResidualListeners",
+  "outsideRootRejected",
   "unsupportedHarnessLoudNoFallback",
 ];
 
@@ -74,11 +94,20 @@ const RESULT_LABELS = {
   killAlphaBravoIsolated: "Kill alpha while bravo remains active",
   noResidualProcesses: "Spawned ACP process trees fully exited",
   unsupportedHarnessLoudNoFallback: "Unsupported harness/version is loud, no fallback",
+  nativeSteeringAdvertised: "Native steering advertised by initialize",
+  inFlightBeforeOriginalCompletion: "In-flight update observed before original completion",
+  originalTaskMarkerRetained: "Original-task marker retained",
+  injectedEventMarkerIncorporated: "Injected-event marker incorporated",
+  midTurnDelivery: "Mid-turn delivery",
+  typedConfigDiffAllowlisted: "Typed diff: changed paths inside reviewed allowlist",
+  acpProcessTreeExited: "ACP adapter process tree exited",
+  noResidualListeners: "No residual listener handles",
 };
 
 /** Registered spike slugs -> human-readable report titles. */
 export const SPIKE_TITLES = {
   "t3-codex": "T3 — Codex Definition Materializer Spike",
+  "t4-codex": "T4 — Codex Mid-Turn Delivery Spike",
 };
 
 const OS_VALUES = ["macos", "linux", "windows", "other"];
@@ -87,6 +116,15 @@ const ADAPTER_VALUES = [
   "@agentclientprotocol/codex-acp",
   "claude-agent-acp",
   "opencode",
+];
+const T4_PLATFORM_VALUES = [
+  "darwin-arm64",
+  "darwin-x64",
+  "linux-arm64",
+  "linux-x64",
+  "win32-arm64",
+  "win32-x64",
+  "other",
 ];
 const VISIBILITY_VALUES = ["not-published"];
 
@@ -165,6 +203,51 @@ export const SCHEMA = {
   },
 };
 
+const T4_SCHEMA = {
+  type: "object",
+  keys: {
+    schemaVersion: leaf.version,
+    spike: inSet(["t4-codex"]),
+    capturedAt: leaf.isoTimestamp,
+    publicProvenance: {
+      type: "object",
+      keys: { integrationCommit: leaf.gitSha },
+    },
+    localProvenance: {
+      type: "object",
+      keys: {
+        visibility: inSet(VISIBILITY_VALUES),
+        runnerSha: leaf.gitSha,
+        captureSha256: leaf.sha256,
+        // A fixed label keeps the local-record reference useful for audit
+        // equality without publishing a per-run identifier.
+        recordId: inSet(["accepted-local-record"]),
+      },
+    },
+    environment: {
+      type: "object",
+      keys: {
+        os: inSet(OS_VALUES),
+        osVersion: leaf.version,
+        harness: inSet(HARNESS_VALUES),
+        harnessVersion: leaf.version,
+        adapterName: inSet(ADAPTER_VALUES),
+        adapterVersion: leaf.version,
+        nodePinned: leaf.version,
+        platform: inSet(T4_PLATFORM_VALUES),
+        nodePinnedMatched: leaf.boolean,
+      },
+    },
+    results: {
+      type: "object",
+      dynamic: true,
+      keyCheck: (key) => T4_RESULT_KEYS.includes(key),
+      valueCheck: leaf.status,
+      requiredKeys: T4_RESULT_KEYS,
+    },
+  },
+};
+
 function validateObject(schemaNode, value, path, errors) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     errors.push(`${path}: expected an object`);
@@ -217,7 +300,8 @@ function validateObject(schemaNode, value, path, errors) {
  */
 export function validateSummary(value) {
   const errors = [];
-  validateObject(SCHEMA, value, "$", errors);
+  const schema = value?.spike === "t4-codex" ? T4_SCHEMA : SCHEMA;
+  validateObject(schema, value, "$", errors);
   return errors;
 }
 
@@ -229,8 +313,8 @@ function titleFor(spike) {
   return title;
 }
 
-function negativeSummary(results) {
-  const negatives = RESULT_KEYS.filter((key) => results[key] === "NEGATIVE" || results[key] === "UNAVAILABLE");
+function negativeSummary(results, keys = RESULT_KEYS) {
+  const negatives = keys.filter((key) => results[key] === "NEGATIVE" || results[key] === "UNAVAILABLE");
   if (negatives.length === 0) return "";
   const rows = negatives.map((key) => `- ${RESULT_LABELS[key]}: ${results[key]}`).join("\n");
   return [
@@ -251,6 +335,7 @@ function negativeSummary(results) {
  * + typed values are interpolated; no free-form host/path/environment content.
  */
 export function renderReport(summary) {
+  if (summary.spike === "t4-codex") return renderT4Report(summary);
   const { environment, publicProvenance, localProvenance, results, capturedAt } = summary;
   const title = titleFor(summary.spike);
   const created = capturedAt.slice(0, 10);
@@ -317,6 +402,77 @@ export function renderReport(summary) {
     "- A `NEGATIVE` or `UNAVAILABLE` result is a recorded conclusion, never a skipped row.",
     "- The strict schema admits no free-form string fields, so host paths, hostnames, usernames,",
     "  temp identifiers, prompts and raw environment content cannot appear in a public summary.",
+    "",
+  ].join("\n");
+}
+
+function renderT4Report(summary) {
+  const { environment, publicProvenance, localProvenance, results, capturedAt } = summary;
+  const title = titleFor(summary.spike);
+  const created = capturedAt.slice(0, 10);
+  const provenanceLines = [
+    `- \`publicProvenance.integrationCommit\` — \`${publicProvenance.integrationCommit}\`. Publicly inspectable:`,
+    "  carries the resolved commit holding the reconstructed runner and contract source.",
+    `- \`localProvenance.visibility\` — \`${localProvenance.visibility}\`.`,
+    `- \`localProvenance.runnerSha\` — \`${localProvenance.runnerSha}\`. Equality anchor for the`,
+    "  private review record; not independently reproducible from this branch.",
+    `- \`localProvenance.captureSha256\` — \`${localProvenance.captureSha256}\`. Aggregate of the`,
+    "  accepted local capture; raw host-specific artifacts are not part of this branch.",
+    `- \`localProvenance.recordId\` — \`${localProvenance.recordId}\`. Fixed local-record label; it is`,
+    "  not a session, host, path, user, or per-run identifier.",
+  ].join("\n");
+  const envRows = [
+    ["Operating system", environment.os, environment.osVersion],
+    ["Harness", environment.harness, environment.harnessVersion],
+    ["Adapter", environment.adapterName, environment.adapterVersion],
+    ["Pinned Node", environment.nodePinned, environment.nodePinnedMatched ? "matched" : "NOT matched"],
+    ["Platform", environment.platform, "-"],
+  ]
+    .map(([label, value, detail]) => `| ${label} | \`${value}\` | ${detail === "-" ? "-" : `\`${detail}\``} |`)
+    .join("\n");
+  const resultRows = T4_RESULT_KEYS.map((key) => {
+    const status = results[key];
+    const disposition =
+      status === "NEGATIVE" ? "recorded negative" : status === "UNAVAILABLE" ? "explicitly unavailable" : status;
+    return `| ${RESULT_LABELS[key]} | ${status} | ${disposition} |`;
+  }).join("\n");
+
+  return [
+    "---",
+    `title: "${title}"`,
+    "tags: [weave, m0, evidence, summary]",
+    "status: active",
+    `created: ${created}`,
+    "---",
+    "",
+    `# ${title}`,
+    "",
+    `Captured ${capturedAt}. Schema version ${summary.schemaVersion}. This report is`,
+    "regenerated byte-for-byte from `summary.json` by `scripts/verify-evidence.mjs` in CI, so prose",
+    "cannot drift from the data. Raw host-specific captures stay local-only and never enter this",
+    "branch.",
+    "",
+    "## Provenance",
+    "",
+    provenanceLines,
+    "",
+    "## Environment (enumerated, captured from the tool, never hardcoded)",
+    "",
+    "| Field | Value | Detail |",
+    "|---|---|---|",
+    envRows,
+    "",
+    "## Results",
+    "",
+    "| Criterion | Status | Disposition |",
+    "|---|---|---|",
+    resultRows,
+    negativeSummary(results, T4_RESULT_KEYS),
+    "## Notes",
+    "",
+    "- A `NEGATIVE` or `UNAVAILABLE` result is a recorded conclusion, never a skipped row.",
+    "- This fixed T4 schema admits only statuses, enumerated runtime fields, fixed provenance",
+    "  anchors, and no model, prompt, session, host, path, user, or raw environment content.",
     "",
   ].join("\n");
 }
