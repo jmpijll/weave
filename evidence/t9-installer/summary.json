@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "1.0.0",
+  "spike": "t9-installer",
+  "capturedAt": "2026-08-17T18:52:00Z",
+  "publicProvenance": {
+    "integrationCommit": "35f8e7983750000041f02a8775b6f7c9ca7fdb22"
+  },
+  "localProvenance": {
+    "visibility": "not-published",
+    "runnerSha": "35f8e7983750000041f02a8775b6f7c9ca7fdb22",
+    "captureSha256": "80ad22e1cdb9c80581d1d5b0ea39b21546e058acd1b333a98d941c91e54f36db",
+    "recordId": "weave-t9-installer-docker-desktop-2026-08-17"
+  },
+  "environment": {
+    "os": "macos",
+    "osVersion": "26.5.2",
+    "arch": "arm64",
+    "containerRuntime": "docker-desktop",
+    "dockerVersion": "29.6.2",
+    "dockerDaemonVersion": "29.6.2",
+    "composeVersion": "5.3.1",
+    "nodePinned": "24.12.0",
+    "platform": "darwin-arm64",
+    "nodePinnedMatched": true
+  },
+  "results": {
+    "nodeRuntimeConsistency": "PASS",
+    "capabilityGate": "PASS",
+    "bootstrapVerify": "PASS",
+    "ociPullFailureZeroState": "PASS",
+    "startFailureRollbackZeroState": "PASS",
+    "dbServerHealth": "PASS",
+    "health200": "PASS",
+    "projectTeardownZeroState": "PASS"
+  }
+}
