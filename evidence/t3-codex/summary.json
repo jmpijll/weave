@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "1.0.0",
+  "spike": "t3-codex",
+  "capturedAt": "2026-08-16T18:36:12Z",
+  "publicProvenance": {
+    "integrationCommit": "86ea385a2639221973162071876762c1c2e57942"
+  },
+  "localProvenance": {
+    "visibility": "not-published",
+    "runnerSha": "ce374fd590a317bbbc7aa015a9d879adcef82028",
+    "captureSha256": "6c6cc98770580008e994995948058de1146df567b100e21a3751c229a6d6021f",
+    "recordId": "weave-t3-codex-senior-review-2026-08-16"
+  },
+  "environment": {
+    "os": "macos",
+    "osVersion": "26.5.2",
+    "harness": "codex",
+    "harnessVersion": "0.145.0",
+    "adapterName": "@agentclientprotocol/codex-acp",
+    "adapterVersion": "1.1.7",
+    "nodePinned": "24.12.0",
+    "platform": "darwin-arm64",
+    "nodePinnedMatched": true
+  },
+  "results": {
+    "projectInstructionsLoad": "PASS",
+    "projectSkillVisible": "PASS",
+    "globalCollisionFixture": "NEGATIVE",
+    "projectSkillBeatsGlobal": "NEGATIVE",
+    "globalFixtureUnchanged": "PASS",
+    "configChangedPathsAllowlisted": "PASS",
+    "homeInheritedNoOverride": "PASS",
+    "nodePinExact": "PASS",
+    "authenticatedTurn": "PASS",
+    "concurrentIsolation": "PASS",
+    "outsideRootRejected": "PASS",
+    "killAlphaBravoIsolated": "PASS",
+    "noResidualProcesses": "PASS",
+    "unsupportedHarnessLoudNoFallback": "PASS"
+  }
+}
