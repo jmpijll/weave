@@ -6,6 +6,13 @@ import { pathToFileURL } from "node:url";
 
 const root = resolve(import.meta.dirname, "..");
 const runtimeApplications = ["server", "daemon"];
+const rawPackages = [
+  { name: "protocol", packageRoot: resolve(root, "packages/protocol") },
+  ...runtimeApplications.map((name) => ({
+    name,
+    packageRoot: resolve(root, "apps", name),
+  })),
+];
 const clientEntry = resolve(root, "apps/client/src/index.ts");
 
 for (const application of runtimeApplications) {
@@ -23,11 +30,14 @@ const clientSource = await readFile(clientEntry, "utf8");
 assert.match(clientSource, /import type .* from ["']@weave\/protocol["']/s);
 assert.match(clientSource, /export type ClientMessage/);
 
-for (const application of runtimeApplications) {
-  const fixture = resolve(root, "apps", application, "fixtures/non-erasable-enum.ts");
-  const enumCheck = spawnSync(process.execPath, [fixture], { encoding: "utf8" });
-  assert.notEqual(enumCheck.status, 0, `${application} must reject non-erasable enum syntax`);
-  assert.match(enumCheck.stderr, /ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX/);
+for (const { name, packageRoot } of rawPackages) {
+  const fixture = resolve(packageRoot, "fixtures/non-erasable-enum.ts");
+
+  if (runtimeApplications.includes(name)) {
+    const enumCheck = spawnSync(process.execPath, [fixture], { encoding: "utf8" });
+    assert.notEqual(enumCheck.status, 0, `${name} must reject non-erasable enum syntax`);
+    assert.match(enumCheck.stderr, /ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX/);
+  }
 
   const fixtureSource = await readFile(fixture, "utf8");
   assert.match(fixtureSource, /^enum /m);
@@ -42,18 +52,18 @@ for (const application of runtimeApplications) {
   );
   const compileCheck = spawnSync(
     tsc,
-    ["--noEmit", "--pretty", "false", "-p", resolve(root, "apps", application, "fixtures/tsconfig.json")],
+    ["--noEmit", "--pretty", "false", "-p", resolve(packageRoot, "fixtures/tsconfig.json")],
     { encoding: "utf8" },
   );
   const diagnostics = `${compileCheck.stdout}\n${compileCheck.stderr}`;
   assert.notEqual(
     compileCheck.status,
     0,
-    `${application} fixture must fail compilation with erasableSyntaxOnly enabled`,
+    `${name} fixture must fail compilation with erasableSyntaxOnly enabled`,
   );
   assert.ok(
     (diagnostics.match(/TS1294/g) ?? []).length >= 3,
-    `${application} fixture must report enum, namespace, and parameter-property diagnostics`,
+    `${name} fixture must report enum, namespace, and parameter-property diagnostics`,
   );
 }
 
