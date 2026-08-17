@@ -4,10 +4,10 @@
  *
  * On a host whose ambient PATH holds an older `node`, a child spawned by the
  * installer could silently re-resolve `node` (via `#!/usr/bin/env node`) to
- * that older binary, so bootstrap and verify would NOT run under the pinned
- * 24.12.0. This regression proves `subprocessEnv()` prepends a shim that
- * resolves `node` to `process.execPath`, regardless of what the ambient PATH
- * would have selected first.
+ * that older binary, so bootstrap and verify would NOT run under the Node
+ * binary the parent launched with. This regression proves `subprocessEnv()`
+ * prepends a shim that resolves `node` to `process.execPath`, regardless of
+ * what the ambient PATH would have selected first.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -15,6 +15,39 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, delimiter } from "node:path";
 import { subprocessEnv } from "./node-runtime-env.mjs";
+
+// Documented Node floor (numeric >=24.12.0), consistent with scripts/install.mjs.
+const NODE_FLOOR = [24, 12, 0];
+
+// Numeric >= floor comparison (never lexical), mirroring the install gate.
+// Returns true for the floor and every floor-permitted newer runtime.
+function atLeastFloor(nodeVersion) {
+  const v = String(nodeVersion).replace(/^v/, "").split(".").map(Number);
+  for (let i = 0; i < NODE_FLOOR.length; i++) {
+    if (v[i] > NODE_FLOOR[i]) return true;
+    if (v[i] < NODE_FLOOR[i]) return false;
+  }
+  return true;
+}
+
+// A floor-permitted newer version must never be rejected (the regression is
+// a floor gate, not a patch-exact pin).
+function testFloorGate() {
+  const cases = [
+    ["22.22.3", false],
+    ["24.11.9", false],
+    ["24.12.0", true],
+    ["24.12.1", true],
+    ["24.13.0", true],
+    ["25.0.0", true],
+    ["26.1.0", true],
+  ];
+  for (const [ver, expected] of cases) {
+    assert.equal(atLeastFloor(ver), expected, `floor gate for ${ver}`);
+  }
+}
+
+testFloorGate();
 
 const originalPath = process.env.PATH;
 
@@ -51,8 +84,13 @@ async function testAmbientOldNodeCannotWin() {
     }).trim();
     assert.equal(resolved, process.execPath, "child node must resolve to process.execPath (pinned binary)");
 
-    // The pinned binary itself must be the 24.12 line that launched this test.
-    assert.match(process.version, /^v24\.12\.0$/, "this regression must itself run under pinned Node 24.12.0");
+    // This regression itself must run under the documented Node floor (numeric
+    // >=24.12.0), never a patch-exact pin: a floor-permitted newer runtime is
+    // accepted, exactly as in scripts/install.mjs.
+    assert.ok(
+      atLeastFloor(process.version.slice(1)),
+      `this regression must run under Node >=24.12.0 (running ${process.version})`
+    );
   } finally {
     process.env.PATH = originalPath;
     await rm(dir, { recursive: true, force: true });
@@ -60,4 +98,6 @@ async function testAmbientOldNodeCannotWin() {
 }
 
 await testAmbientOldNodeCannotWin();
-console.log("ok - child node resolves to process.execPath even when ambient PATH holds an older node");
+console.log(
+  `ok - child node resolves to process.execPath (floor Node >=24.12.0, running ${process.version}) even when ambient PATH holds an older node`
+);
