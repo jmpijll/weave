@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { resolveArtifactsDir } from "./t3-codex-materializer.mjs";
-import { validateSummary, RESULT_KEYS, T9_RESULT_KEYS } from "./evidence-contract.mjs";
+import { validateSummary, RESULT_KEYS, T9_RESULT_KEYS, T4_RESULT_KEYS } from "./evidence-contract.mjs";
 import { verifyTree, verifyIntegrationCommitAncestors } from "./verify-evidence.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -486,6 +486,114 @@ async function testT9ResultKeysFixed() {
   );
 }
 
+function validT4Summary(overrides = {}) {
+  const results = {};
+  for (const key of T4_RESULT_KEYS) results[key] = "PASS";
+  return {
+    schemaVersion: "1.0.0",
+    spike: "t4-codex",
+    capturedAt: "2026-08-17T16:06:15Z",
+    publicProvenance: { integrationCommit: "0".repeat(40) },
+    localProvenance: {
+      visibility: "not-published",
+      runnerSha: "1".repeat(40),
+      captureSha256: "2".repeat(64),
+      recordId: "accepted-local-record",
+    },
+    environment: {
+      os: "macos",
+      osVersion: "25.5.0",
+      harness: "codex",
+      harnessVersion: "0.145.0",
+      adapterName: "@agentclientprotocol/codex-acp",
+      adapterVersion: "1.1.7",
+      nodePinned: "24.12.0",
+      platform: "darwin-arm64",
+      nodePinnedMatched: true,
+    },
+    results,
+    ...overrides,
+  };
+}
+
+async function testT4ConformantSummaryAccepted() {
+  const errors = validateSummary(validT4Summary());
+  assert.deepEqual(errors, [], "conformant t4-codex summary must validate clean through the one registry");
+}
+
+async function testT4ResultKeysFixed() {
+  const unknown = validT4Summary();
+  unknown.results.unreviewedCriterion = "PASS";
+  assert.ok(
+    validateSummary(unknown).some((e) => e.includes("unreviewedCriterion")),
+    "t4-codex must reject an unknown result key",
+  );
+
+  const missing = validT4Summary();
+  delete missing.results.midTurnDelivery;
+  assert.ok(
+    validateSummary(missing).some((e) => e.includes("midTurnDelivery") && e.includes("missing")),
+    "t4-codex must reject a missing reviewed result key",
+  );
+
+  const crossT3 = validT4Summary();
+  crossT3.results.projectInstructionsLoad = "PASS";
+  assert.ok(
+    validateSummary(crossT3).some((e) => e.includes("projectInstructionsLoad")),
+    "t4-codex must not accept t3-only result keys",
+  );
+}
+
+async function testT4UnknownKeyNegative() {
+  // An unknown key in a copy of the t4 summary must fail validation.
+  const unknownTop = validT4Summary();
+  unknownTop.hostname = "invented-host";
+  assert.ok(
+    validateSummary(unknownTop).some((e) => e.includes("hostname")),
+    "t4-codex unknown top-level key must fail",
+  );
+
+  const unknownProvenance = validT4Summary();
+  unknownProvenance.localProvenance.rawPath = "/opt/example/sandbox";
+  assert.ok(
+    validateSummary(unknownProvenance).some((e) => e.includes("localProvenance.rawPath")),
+    "t4-codex unknown provenance key must fail",
+  );
+}
+
+async function testT4EnvironmentEnumerated() {
+  const badPlatform = validT4Summary();
+  badPlatform.environment.platform = "invented-runner-host";
+  assert.ok(
+    validateSummary(badPlatform).some((e) => e.includes("environment.platform")),
+    "t4-codex platform must reject an unenumerated value",
+  );
+
+  const badRecord = validT4Summary();
+  badRecord.localProvenance.recordId = "synthetic-run-record";
+  assert.ok(
+    validateSummary(badRecord).some((e) => e.includes("localProvenance.recordId")),
+    "t4-codex recordId must be the fixed accepted-local-record label",
+  );
+
+  const badNode = validT4Summary();
+  badNode.environment.nodePinned = "24.12.0-injected/../../etc/passwd";
+  assert.ok(
+    validateSummary(badNode).some((e) => e.includes("nodePinned")),
+    "t4-codex nodePinned must reject an anchored-version bypass",
+  );
+}
+
+async function testT4ReportRoundTripStable() {
+  const { renderReport } = await import("./evidence-contract.mjs");
+  const summary = validT4Summary();
+  assert.equal(renderReport(summary), renderReport(summary), "t4 report must be deterministic");
+  assert.ok(
+    renderReport(summary).includes("This fixed T4 schema admits only statuses"),
+    "t4 report must carry the fixed T4 schema note",
+  );
+}
+
 const tests = [
   testConformantSummaryAccepted,
   testUnexpectedDirectory,
@@ -504,6 +612,11 @@ const tests = [
   testT9ConformantSummaryAccepted,
   testT9EnvironmentEnumerated,
   testT9ResultKeysFixed,
+  testT4ConformantSummaryAccepted,
+  testT4ResultKeysFixed,
+  testT4UnknownKeyNegative,
+  testT4EnvironmentEnumerated,
+  testT4ReportRoundTripStable,
 ];
 
 for (const test of tests) {

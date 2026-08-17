@@ -20,6 +20,13 @@
  * identifiers, context names, project names, prompts or raw environment content
  * cannot be expressed. Unknown keys, unknown values, omitted required keys,
  * anchored-version bypasses, extra files and unknown spikes all fail closed.
+ *
+ * One registry (`SPIKE_DEFS`) owns every spike's title, exact environment keys
+ * and leaf rules, exact reviewed result keys/labels, ordered report rows, and
+ * the fixed report prose. Validation builds an exact object schema from the
+ * entry and rendering reads the same entry, so no spike is handled by a
+ * special-case renderer and the T3/T4/T9 committed reports regenerate
+ * byte-for-byte.
  */
 
 /**
@@ -59,6 +66,23 @@ export const RESULT_KEYS = [
   "unsupportedHarnessLoudNoFallback",
 ];
 
+/** Fixed, reviewed set of T4 result keys (order is the report's row order). */
+export const T4_RESULT_KEYS = [
+  "nodePinExact",
+  "homeInheritedNoOverride",
+  "authenticatedTurn",
+  "nativeSteeringAdvertised",
+  "inFlightBeforeOriginalCompletion",
+  "originalTaskMarkerRetained",
+  "injectedEventMarkerIncorporated",
+  "midTurnDelivery",
+  "typedConfigDiffAllowlisted",
+  "acpProcessTreeExited",
+  "noResidualListeners",
+  "outsideRootRejected",
+  "unsupportedHarnessLoudNoFallback",
+];
+
 /** Fixed, reviewed set of T9 result keys (order is the report's row order). */
 export const T9_RESULT_KEYS = [
   "nodeRuntimeConsistency",
@@ -90,6 +114,22 @@ const T3_RESULT_LABELS = {
   unsupportedHarnessLoudNoFallback: "Unsupported harness/version is loud, no fallback",
 };
 
+const T4_RESULT_LABELS = {
+  nodePinExact: "Exact pinned Node version",
+  homeInheritedNoOverride: "HOME inherited and no override variable set by runner",
+  authenticatedTurn: "Authenticated inherited-HOME turn",
+  nativeSteeringAdvertised: "Native steering advertised by initialize",
+  inFlightBeforeOriginalCompletion: "In-flight update observed before original completion",
+  originalTaskMarkerRetained: "Original-task marker retained",
+  injectedEventMarkerIncorporated: "Injected-event marker incorporated",
+  midTurnDelivery: "Mid-turn delivery",
+  typedConfigDiffAllowlisted: "Typed diff: changed paths inside reviewed allowlist",
+  acpProcessTreeExited: "ACP adapter process tree exited",
+  noResidualListeners: "No residual listener handles",
+  outsideRootRejected: "Outside-root materialization rejected",
+  unsupportedHarnessLoudNoFallback: "Unsupported harness/version is loud, no fallback",
+};
+
 const T9_RESULT_LABELS = {
   nodeRuntimeConsistency: "Node-runtime consistency (children resolve to pinned node, no unsupported-engine)",
   capabilityGate: "compose up --wait capability gate before any mutation",
@@ -115,70 +155,16 @@ const CONTAINER_RUNTIME_VALUES = [
   "podman",
   "other",
 ];
+const T4_PLATFORM_VALUES = [
+  "darwin-arm64",
+  "darwin-x64",
+  "linux-arm64",
+  "linux-x64",
+  "win32-arm64",
+  "win32-x64",
+  "other",
+];
 const VISIBILITY_VALUES = ["not-published"];
-
-/**
- * Per-spike definition. `environmentFields` is an ordered list of field specs
- * used both for schema validation and report rendering. `environmentKeys` is
- * the exact required set of environment keys for that spike.
- */
-const SPIKE_DEFS = {
-  "t3-codex": {
-    title: "T3 — Codex Definition Materializer Spike",
-    environmentKeys: [
-      "os",
-      "osVersion",
-      "harness",
-      "harnessVersion",
-      "adapterName",
-      "adapterVersion",
-      "nodePinned",
-      "platform",
-      "nodePinnedMatched",
-    ],
-    envRows: [
-      { label: "Operating system", value: "os", detail: "osVersion" },
-      { label: "Harness", value: "harness", detail: "harnessVersion" },
-      { label: "Adapter", value: "adapterName", detail: "adapterVersion" },
-      { label: "Pinned Node", value: "nodePinned", matched: true },
-      { label: "Platform", value: "platform", detail: null },
-    ],
-    resultKeys: RESULT_KEYS,
-    resultLabels: T3_RESULT_LABELS,
-  },
-  "t9-installer": {
-    title: "T9 — Ordered-Gate Installer and Compose Skeleton Spike",
-    environmentKeys: [
-      "os",
-      "osVersion",
-      "arch",
-      "containerRuntime",
-      "dockerVersion",
-      "dockerDaemonVersion",
-      "composeVersion",
-      "nodePinned",
-      "platform",
-      "nodePinnedMatched",
-    ],
-    envRows: [
-      { label: "Operating system", value: "os", detail: "osVersion" },
-      { label: "Architecture", value: "arch", detail: null },
-      { label: "Container runtime", value: "containerRuntime", detail: null },
-      { label: "Docker client version", value: "dockerVersion", detail: null },
-      { label: "Docker daemon version", value: "dockerDaemonVersion", detail: null },
-      { label: "Docker Compose version", value: "composeVersion", detail: null },
-      { label: "Pinned Node", value: "nodePinned", matched: true },
-      { label: "Platform", value: "platform", detail: null },
-    ],
-    resultKeys: T9_RESULT_KEYS,
-    resultLabels: T9_RESULT_LABELS,
-  },
-};
-
-/** Registered spike slugs -> human-readable report titles. */
-export const SPIKE_TITLES = Object.fromEntries(
-  Object.entries(SPIKE_DEFS).map(([slug, def]) => [slug, def.title]),
-);
 
 /**
  * Environment field schema: each field maps to a validator function that
@@ -214,13 +200,147 @@ const leaf = {
   status: (value) => RESULT_STATUSES.includes(value),
 };
 
+/**
+ * Per-spike definition carried entirely as data so the shared validator and
+ * shared renderer need no spike-specific branching:
+ *
+ * - `title`             immutable report title
+ * - `environmentKeys`   exact required environment keys, in report display order
+ * - `envLeafOverride`   optional per-key validator override (e.g. enumerated platform)
+ * - `envRows`           ordered report table rows (label / value / detail)
+ * - `resultKeys`        exact reviewed result-key set (order is report row order)
+ * - `resultLabels`      human-readable row labels
+ * - `recordIdCheck`     optional fixed recordId rule (default: logical id)
+ * - `prose`             the fixed report prose this spike's committed REPORT uses
+ */
+const SPIKE_DEFS = {
+  "t3-codex": {
+    title: "T3 — Codex Definition Materializer Spike",
+    environmentKeys: [
+      "os",
+      "osVersion",
+      "harness",
+      "harnessVersion",
+      "adapterName",
+      "adapterVersion",
+      "nodePinned",
+      "platform",
+      "nodePinnedMatched",
+    ],
+    envRows: [
+      { label: "Operating system", value: "os", detail: "osVersion" },
+      { label: "Harness", value: "harness", detail: "harnessVersion" },
+      { label: "Adapter", value: "adapterName", detail: "adapterVersion" },
+      { label: "Pinned Node", value: "nodePinned", matched: true },
+      { label: "Platform", value: "platform", detail: null },
+    ],
+    resultKeys: RESULT_KEYS,
+    resultLabels: T3_RESULT_LABELS,
+    prose: {
+      integrationCommit: "carries the resolved commit holding the reviewable runner and contract source.",
+      runnerSha: ["Local equality anchor for the", "  private review record; not independently reproducible from this branch."],
+      captureSha256: ["Aggregate of the raw", "  host-specific captures, which are local-only and not part of this branch."],
+      recordId: ["Logical audit identifier; it is", "  an equality anchor and never an absolute path."],
+      notes: [
+        "The strict schema admits no free-form string fields, so host paths, hostnames, usernames,",
+        "  temp identifiers, prompts and raw environment content cannot appear in a public summary.",
+      ],
+    },
+  },
+  "t4-codex": {
+    title: "T4 — Codex Mid-Turn Delivery Spike",
+    environmentKeys: [
+      "os",
+      "osVersion",
+      "harness",
+      "harnessVersion",
+      "adapterName",
+      "adapterVersion",
+      "nodePinned",
+      "platform",
+      "nodePinnedMatched",
+    ],
+    envLeafOverride: { platform: (value) => typeof value === "string" && T4_PLATFORM_VALUES.includes(value) },
+    envRows: [
+      { label: "Operating system", value: "os", detail: "osVersion" },
+      { label: "Harness", value: "harness", detail: "harnessVersion" },
+      { label: "Adapter", value: "adapterName", detail: "adapterVersion" },
+      { label: "Pinned Node", value: "nodePinned", matched: true },
+      { label: "Platform", value: "platform", detail: null },
+    ],
+    resultKeys: T4_RESULT_KEYS,
+    resultLabels: T4_RESULT_LABELS,
+    recordIdCheck: (value) => typeof value === "string" && value === "accepted-local-record",
+    prose: {
+      integrationCommit: "carries the resolved commit holding the reconstructed runner and contract source.",
+      runnerSha: ["Equality anchor for the", "  private review record; not independently reproducible from this branch."],
+      captureSha256: ["Aggregate of the", "  accepted local capture; raw host-specific artifacts are not part of this branch."],
+      recordId: ["Fixed local-record label; it is", "  not a session, host, path, user, or per-run identifier."],
+      notes: [
+        "This fixed T4 schema admits only statuses, enumerated runtime fields, fixed provenance",
+        "  anchors, and no model, prompt, session, host, path, user, or raw environment content.",
+      ],
+    },
+  },
+  "t9-installer": {
+    title: "T9 — Ordered-Gate Installer and Compose Skeleton Spike",
+    environmentKeys: [
+      "os",
+      "osVersion",
+      "arch",
+      "containerRuntime",
+      "dockerVersion",
+      "dockerDaemonVersion",
+      "composeVersion",
+      "nodePinned",
+      "platform",
+      "nodePinnedMatched",
+    ],
+    envRows: [
+      { label: "Operating system", value: "os", detail: "osVersion" },
+      { label: "Architecture", value: "arch", detail: null },
+      { label: "Container runtime", value: "containerRuntime", detail: null },
+      { label: "Docker client version", value: "dockerVersion", detail: null },
+      { label: "Docker daemon version", value: "dockerDaemonVersion", detail: null },
+      { label: "Docker Compose version", value: "composeVersion", detail: null },
+      { label: "Pinned Node", value: "nodePinned", matched: true },
+      { label: "Platform", value: "platform", detail: null },
+    ],
+    resultKeys: T9_RESULT_KEYS,
+    resultLabels: T9_RESULT_LABELS,
+    prose: {
+      integrationCommit: "carries the resolved commit holding the reviewable runner and contract source.",
+      runnerSha: ["Local equality anchor for the", "  private review record; not independently reproducible from this branch."],
+      captureSha256: ["Aggregate of the raw", "  host-specific captures, which are local-only and not part of this branch."],
+      recordId: ["Logical audit identifier; it is", "  an equality anchor and never an absolute path."],
+      notes: [
+        "The strict schema admits no free-form string fields, so host paths, hostnames, usernames,",
+        "  temp identifiers, prompts and raw environment content cannot appear in a public summary.",
+      ],
+    },
+  },
+};
+
+/** Registered spike slugs -> human-readable report titles. */
+export const SPIKE_TITLES = Object.fromEntries(
+  Object.entries(SPIKE_DEFS).map(([slug, def]) => [slug, def.title]),
+);
+
+/**
+ * Build the discriminated environment schema for a spike from its data entry.
+ */
 function envSchemaFor(spike) {
   const def = SPIKE_DEFS[spike];
   const keys = {};
   for (const key of def.environmentKeys) {
-    keys[key] = envLeaf[key];
+    keys[key] = def.envLeafOverride?.[key] ?? envLeaf[key];
   }
   return { type: "object", keys };
+}
+
+function recordIdLeaf(spike) {
+  const def = SPIKE_DEFS[spike];
+  return def.recordIdCheck ?? leaf.logicalId;
 }
 
 /**
@@ -245,7 +365,7 @@ function schemaFor(spike) {
           visibility: { check: (value) => VISIBILITY_VALUES.includes(value) },
           runnerSha: leaf.gitSha,
           captureSha256: leaf.sha256,
-          recordId: leaf.logicalId,
+          recordId: recordIdLeaf(spike),
         },
       },
       environment: envSchemaFor(spike),
@@ -373,44 +493,28 @@ function environmentRows(def, environment) {
     .join("\n");
 }
 
-function envLabel(key) {
-  const labels = {
-    os: "Operating system",
-    osVersion: "OS version",
-    harness: "Harness",
-    harnessVersion: "Harness version",
-    adapterName: "Adapter",
-    adapterVersion: "Adapter version",
-    nodePinned: "Pinned Node",
-    arch: "Architecture",
-    containerRuntime: "Container runtime",
-    dockerVersion: "Docker client version",
-    dockerDaemonVersion: "Docker daemon version",
-    composeVersion: "Docker Compose version",
-    platform: "Platform",
-  };
-  return labels[key] ?? key;
-}
-
 /**
  * Render REPORT.md deterministically from a validated summary. Only enumerated
  * + typed values are interpolated; no free-form host/path/environment content.
+ * All prose is read from the spike's registry entry, so the committed reports
+ * regenerate byte-for-byte with no spike-specific renderer path.
  */
 export function renderReport(summary) {
   const def = SPIKE_DEFS[summary.spike];
   const { environment, publicProvenance, localProvenance, results, capturedAt } = summary;
   const title = titleFor(summary.spike);
   const created = capturedAt.slice(0, 10);
+  const prose = def.prose;
   const provenanceLines = [
     `- \`publicProvenance.integrationCommit\` — \`${publicProvenance.integrationCommit}\`. Publicly inspectable:`,
-    "  carries the resolved commit holding the reviewable runner and contract source.",
+    `  ${prose.integrationCommit}`,
     `- \`localProvenance.visibility\` — \`${localProvenance.visibility}\`.`,
-    `- \`localProvenance.runnerSha\` — \`${localProvenance.runnerSha}\`. Local equality anchor for the`,
-    "  private review record; not independently reproducible from this branch.",
-    `- \`localProvenance.captureSha256\` — \`${localProvenance.captureSha256}\`. Aggregate of the raw`,
-    "  host-specific captures, which are local-only and not part of this branch.",
-    `- \`localProvenance.recordId\` — \`${localProvenance.recordId}\`. Logical audit identifier; it is`,
-    "  an equality anchor and never an absolute path.",
+    `- \`localProvenance.runnerSha\` — \`${localProvenance.runnerSha}\`. ${prose.runnerSha[0]}`,
+    prose.runnerSha[1],
+    `- \`localProvenance.captureSha256\` — \`${localProvenance.captureSha256}\`. ${prose.captureSha256[0]}`,
+    prose.captureSha256[1],
+    `- \`localProvenance.recordId\` — \`${localProvenance.recordId}\`. ${prose.recordId[0]}`,
+    prose.recordId[1],
   ].join("\n");
   const resultRows = def.resultKeys
     .map((key) => {
@@ -459,8 +563,7 @@ export function renderReport(summary) {
     "## Notes",
     "",
     "- A `NEGATIVE` or `UNAVAILABLE` result is a recorded conclusion, never a skipped row.",
-    "- The strict schema admits no free-form string fields, so host paths, hostnames, usernames,",
-    "  temp identifiers, prompts and raw environment content cannot appear in a public summary.",
+    ...prose.notes.map((line, index) => (index === 0 && !line.startsWith("- ") ? `- ${line}` : line)),
     "",
   ].join("\n");
 }

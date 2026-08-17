@@ -7,8 +7,8 @@
   "packageManager": "pnpm@10.13.1",
   "scripts": {
     "check": "tsc --noEmit --pretty false -p packages/protocol/tsconfig.json && tsc --noEmit --pretty false -p apps/server/tsconfig.json && tsc --noEmit --pretty false -p apps/daemon/tsconfig.json && tsc --noEmit --pretty false -p apps/client/tsconfig.json",
-    "test": "node scripts/verify-workspaces.mjs && node scripts/smoke.mjs && node scripts/verify-evidence.mjs && node scripts/evidence-contract.test.mjs && node scripts/node-runtime-regression.test.mjs",
-    "evidence": "node scripts/verify-evidence.mjs && node scripts/evidence-contract.test.mjs",
+    "test": "node scripts/test-inventory.mjs",
+    "evidence": "node scripts/test-inventory.mjs",
     "verify": "npm exec --yes --package=pnpm@10.13.1 -- pnpm check && npm exec --yes --package=pnpm@10.13.1 -- pnpm test",
     "spike:t3:codex": "node scripts/t3-codex-materializer.mjs"
   },
