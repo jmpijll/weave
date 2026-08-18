@@ -78,7 +78,7 @@ async function expectReject(
 test("fresh database migrates exactly once; re-run applies nothing", async () => {
   await withFreshDatabase(async (pool) => {
     const first = await runMigrations(pool);
-    assert.deepEqual(first.applied, [1]);
+    assert.deepEqual(first.applied, [1, 2]);
     assert.equal(first.skipped, 0);
 
     const tables = await pool.query(
@@ -94,6 +94,15 @@ test("fresh database migrates exactly once; re-run applies nothing", async () =>
       "credential",
       "host",
       "agent",
+      "member",
+      "role",
+      "permission",
+      "role_permission",
+      "space",
+      "space_membership",
+      "member_role_assignment",
+      "community_admission_invite",
+      "space_invite",
       "audit_event",
     ]) {
       assert.ok(names.includes(expected), `expected table ${expected} to exist`);
@@ -101,7 +110,7 @@ test("fresh database migrates exactly once; re-run applies nothing", async () =>
 
     const second = await runMigrations(pool);
     assert.deepEqual(second.applied, []);
-    assert.equal(second.skipped, 1);
+    assert.equal(second.skipped, 2);
   });
 });
 
@@ -148,10 +157,10 @@ test("a changed checksum on an applied migration is refused", async () => {
 test("concurrent migration starts do not race: exactly one applies, one skips", async () => {
   await withFreshDatabase(async (pool) => {
     const [a, b] = await Promise.all([runMigrations(pool), runMigrations(pool)]);
-    const appliedCount = (a.applied.length === 1 ? 1 : 0) + (b.applied.length === 1 ? 1 : 0);
+    const appliedCount = (a.applied.length === 2 ? 1 : 0) + (b.applied.length === 2 ? 1 : 0);
     assert.equal(appliedCount, 1, "exactly one concurrent run applies the migration");
     const ledger = await pool.query("SELECT count(*)::int AS n FROM public.schema_migration");
-    assert.equal(ledger.rows[0].n, 1);
+    assert.equal(ledger.rows[0].n, 2);
   });
 });
 

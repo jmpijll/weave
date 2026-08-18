@@ -5,6 +5,7 @@ export interface AuditEventInput {
   communityId?: string | null;
   actorPersonId?: string | null;
   actorCredentialId?: string | null;
+  actorMemberId?: string | null;
   targetType: string;
   targetId: string;
   metadata?: Record<string, unknown>;
@@ -22,16 +23,17 @@ export async function writeAuditEvent(
 ): Promise<string> {
   const result = await client.query<{ id: string }>(
     `INSERT INTO audit_event (
-       event_type, community_id, actor_person_id, actor_credential_id,
+       event_type, community_id, actor_person_id, actor_credential_id, actor_member_id,
        target_type, target_id, metadata, correlation_id
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING id`,
     [
       input.eventType,
       input.communityId ?? null,
       input.actorPersonId ?? null,
       input.actorCredentialId ?? null,
+      input.actorMemberId ?? null,
       input.targetType,
       input.targetId,
       JSON.stringify(input.metadata ?? {}),
