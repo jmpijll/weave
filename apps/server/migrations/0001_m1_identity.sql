@@ -65,7 +65,14 @@ CREATE UNIQUE INDEX credential_one_active_root_per_person
 
 CREATE INDEX credential_person_idx ON credential (person_id);
 CREATE INDEX credential_parent_idx ON credential (parent_credential_id);
-CREATE INDEX credential_lookup_idx ON credential (public_key, algorithm);
+
+-- A credential's (algorithm, public_key) identity is unique across the entire
+-- credential lifetime, not merely among active rows: the same authenticator can
+-- never be inserted for a second person, nor re-enrolled after revocation. A
+-- signed-request resolver can therefore select exactly one credential for a
+-- given proof regardless of revocation history (Pass 41; no ambiguous auth).
+CREATE UNIQUE INDEX credential_identity_unique
+  ON credential (algorithm, public_key);
 
 -- Validate that a credential of `p_child_kind` owned by `p_child_person` may sit
 -- at `p_parent_credential` in the bounded tree. Walks every ancestor so a

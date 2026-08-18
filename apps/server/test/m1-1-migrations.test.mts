@@ -426,6 +426,65 @@ test("credential updates revalidate host, agent, and child dependents", async ()
   });
 });
 
+test("credential (algorithm, public_key) is unique across the full lifetime", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+
+    const p1 = (await pool.query(
+      "INSERT INTO person (display_name) VALUES ($1) RETURNING id",
+      ["person-key-a"],
+    )).rows[0].id;
+    const p2 = (await pool.query(
+      "INSERT INTO person (display_name) VALUES ($1) RETURNING id",
+      ["person-key-b"],
+    )).rows[0].id;
+
+    const root1 = (await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind)
+       VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+      [p1, "shared-public-key"],
+    )).rows[0].id;
+
+    // (a) The same algorithm + public_key cannot be inserted for a second person:
+    // the resolver must never face two credentials for one proof across persons.
+    await expectReject(
+      pool,
+      `INSERT INTO credential (person_id, public_key, algorithm, kind)
+       VALUES ($1, $2, 'ed25519', 'human')`,
+      [p2, "shared-public-key"],
+      "duplicate key",
+    );
+
+    // A distinct key for the second person is still allowed.
+    await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind)
+       VALUES ($1, $2, 'ed25519', 'human')`,
+      [p2, "p2-distinct-key"],
+    );
+
+    // (b) The same key cannot be re-enrolled after revocation: revocation keeps
+    // the identity occupied across the credential lifetime.
+    await pool.query(
+      "UPDATE credential SET revoked_at = now(), revoked_reason = 'compromise' WHERE id = $1",
+      [root1],
+    );
+    await expectReject(
+      pool,
+      `INSERT INTO credential (person_id, public_key, algorithm, kind)
+       VALUES ($1, $2, 'ed25519', 'human')`,
+      [p1, "shared-public-key"],
+      "duplicate key",
+    );
+
+    // A brand-new key under the same person is still allowed post-revocation.
+    await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind)
+       VALUES ($1, $2, 'ed25519', 'human')`,
+      [p1, "p1-fresh-key-after-revoke"],
+    );
+  });
+});
+
 test("audit_event is append-only", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
