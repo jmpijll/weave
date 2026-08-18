@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Single reviewed test inventory for Weave M0.
+ * Single reviewed test inventory for Weave.
  *
  * The package `test` command invokes exactly this module once. It is the sole
- * place that names the six existing test layers, so the T4 and T9 command
+ * place that names the eight existing test layers, so the T4 and T9 command
  * strings can no longer drift apart:
  *
  *   1. verify-workspaces.mjs            workspace wiring (protocol dependency,

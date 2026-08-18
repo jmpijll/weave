@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
 import type { DbClient } from "../db/db-client.ts";
+import { inTransaction } from "../db/transaction.ts";
+import { AUDIT_EVENT, writeAuditEvent } from "../db/audit.ts";
 
 export type SpaceKind = "project" | "section" | "channel" | "thread";
 export type Visibility = "public" | "private";
@@ -21,37 +24,53 @@ export interface SpaceRecord {
 /**
  * Create a space node. The DB triggers enforce project-root-only and the
  * project > section > channel > thread parent kind/depth and same-community
- * rules. Optionally records the creator's explicit project-root access grant
- * when `withRootGrantFor` is supplied (project creation), atomically.
+ * rules. When `withRootGrantFor` is supplied (project creation) the space
+ * insert, the creator's explicit project-root access grant, and their typed
+ * audit records are applied in one transaction, so a failing grant can never
+ * leave a project behind.
  */
 export async function createSpace(
   client: DbClient,
   input: SpaceInput,
   withRootGrantFor?: { memberId: string; grantedByMemberId: string },
+  correlationId?: string,
 ): Promise<SpaceRecord> {
-  const result = await client.query<{ id: string; kind: string; visibility: string }>(
-    `INSERT INTO space (community_id, kind, parent_space_id, owner_member_id, visibility, description)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING id, kind, visibility`,
-    [
-      input.communityId,
-      input.kind,
-      input.parentSpaceId ?? null,
-      input.ownerMemberId ?? null,
-      input.visibility,
-      input.description ?? null,
-    ],
-  );
-  const id = result.rows[0].id;
-  if (withRootGrantFor) {
-    await grantSpaceMembership(client, {
-      spaceId: id,
-      memberId: withRootGrantFor.memberId,
-      grantedByMemberId: withRootGrantFor.grantedByMemberId,
-      source: "explicit",
-    });
-  }
-  return { id, kind: result.rows[0].kind as SpaceKind, visibility: result.rows[0].visibility as Visibility };
+  return inTransaction(client, async (tx) => {
+    const result = await tx.query<{ id: string; kind: string; visibility: string }>(
+      `INSERT INTO space (community_id, kind, parent_space_id, owner_member_id, visibility, description)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, kind, visibility`,
+      [
+        input.communityId,
+        input.kind,
+        input.parentSpaceId ?? null,
+        input.ownerMemberId ?? null,
+        input.visibility,
+        input.description ?? null,
+      ],
+    );
+    const id = result.rows[0].id;
+    if (withRootGrantFor) {
+      const cid = correlationId ?? randomUUID();
+      await grantSpaceMembership(tx, {
+        spaceId: id,
+        memberId: withRootGrantFor.memberId,
+        grantedByMemberId: withRootGrantFor.grantedByMemberId,
+        source: "explicit",
+        correlationId: cid,
+      });
+      await writeAuditEvent(tx, {
+        eventType: AUDIT_EVENT.spaceCreated,
+        communityId: input.communityId,
+        actorMemberId: withRootGrantFor.grantedByMemberId,
+        targetType: "space",
+        targetId: id,
+        metadata: { kind: input.kind, visibility: input.visibility },
+        correlationId: cid,
+      });
+    }
+    return { id, kind: result.rows[0].kind as SpaceKind, visibility: result.rows[0].visibility as Visibility };
+  });
 }
 
 export interface GrantSpaceMembershipInput {
@@ -59,33 +78,70 @@ export interface GrantSpaceMembershipInput {
   memberId: string;
   grantedByMemberId: string;
   source: "explicit" | "invite";
+  correlationId?: string;
 }
 
-/** Grant active access to a space (never a role/authority). */
+/** Grant active access to a space (never a role/authority), with typed audit. */
 export async function grantSpaceMembership(
   client: DbClient,
   input: GrantSpaceMembershipInput,
 ): Promise<string> {
-  const result = await client.query<{ id: string }>(
-    `INSERT INTO space_membership (space_id, member_id, grant_source, granted_by_member_id)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id`,
-    [input.spaceId, input.memberId, input.source, input.grantedByMemberId],
-  );
-  return result.rows[0].id;
+  return inTransaction(client, async (tx) => {
+    const result = await tx.query<{ id: string }>(
+      `INSERT INTO space_membership (space_id, member_id, grant_source, granted_by_member_id)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [input.spaceId, input.memberId, input.source, input.grantedByMemberId],
+    );
+    const membershipId = result.rows[0].id;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.spaceAccessGrant,
+      communityId: await spaceCommunityId(tx, input.spaceId),
+      actorMemberId: input.grantedByMemberId,
+      targetType: "space_membership",
+      targetId: membershipId,
+      metadata: { spaceId: input.spaceId, memberId: input.memberId, source: input.source },
+      correlationId: input.correlationId ?? randomUUID(),
+    });
+    return membershipId;
+  });
 }
 
-/** Revoke an active grant, retaining the row for audit. */
+/** Revoke an active grant (retaining the row for audit), with typed audit. */
 export async function revokeSpaceMembership(
   client: DbClient,
   spaceId: string,
   memberId: string,
   reason: string,
+  revokedByMemberId: string,
+  correlationId?: string,
 ): Promise<void> {
-  await client.query(
-    `UPDATE space_membership
-     SET revoked_at = now(), revoked_reason = $3
-     WHERE space_id = $1 AND member_id = $2 AND revoked_at IS NULL`,
-    [spaceId, memberId, reason],
+  await inTransaction(client, async (tx) => {
+    const result = await tx.query(
+      `UPDATE space_membership
+       SET revoked_at = now(), revoked_reason = $3
+       WHERE space_id = $1 AND member_id = $2 AND revoked_at IS NULL
+       RETURNING id`,
+      [spaceId, memberId, reason],
+    );
+    if (result.rows.length === 0) return;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.spaceAccessRevoke,
+      communityId: await spaceCommunityId(tx, spaceId),
+      actorMemberId: revokedByMemberId,
+      targetType: "space_membership",
+      targetId: String(result.rows[0].id),
+      metadata: { spaceId, memberId, reason },
+      correlationId: correlationId ?? randomUUID(),
+    });
+  });
+}
+
+async function spaceCommunityId(client: DbClient, spaceId: string): Promise<string> {
+  const result = await client.query<{ community_id: string }>(
+    "SELECT community_id FROM space WHERE id = $1",
+    [spaceId],
   );
+  if (result.rows.length === 0) throw new Error("space not found");
+  return result.rows[0].community_id;
 }

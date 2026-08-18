@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
 import type { DbClient } from "../db/db-client.ts";
+import { inTransaction } from "../db/transaction.ts";
+import { AUDIT_EVENT, writeAuditEvent } from "../db/audit.ts";
 
 export type PermissionName =
   | "community.members.manage"
@@ -20,6 +23,7 @@ export interface RoleAssignmentInput {
     | { kind: "project"; projectSpaceId: string };
   /** The authenticated actor performing the assignment. */
   grantedByMemberId: string;
+  correlationId?: string;
 }
 
 /** Resolve the seeded role id by name. */
@@ -86,42 +90,95 @@ export async function hasPermission(
 }
 
 /**
- * Assign a bootstrap role to a member at an explicit scope. Returns the new
- * assignment id. The database trigger rejects cross-community, wrong-scope, or
- * non-project-root targets.
+ * Assign a bootstrap role to a member at an explicit scope, with typed audit.
+ * Returns the new assignment id. The database trigger rejects cross-community,
+ * wrong-scope, or non-project-root targets.
  */
 export async function assignRole(
   client: DbClient,
   input: RoleAssignmentInput,
 ): Promise<string> {
-  const roleId = await roleIdForName(client, input.role);
-  if (!roleId) throw new Error(`unknown role: ${input.role}`);
-  const result = await client.query<{ id: string }>(
-    `INSERT INTO member_role_assignment
-       (member_id, role_id, scope_community_id, scope_space_id, granted_by_member_id)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING id`,
-    [
-      input.memberId,
-      roleId,
-      input.scope.kind === "community" ? input.scope.communityId : null,
-      input.scope.kind === "project" ? input.scope.projectSpaceId : null,
-      input.grantedByMemberId,
-    ],
-  );
-  return result.rows[0].id;
+  return inTransaction(client, async (tx) => {
+    const roleId = await roleIdForName(tx, input.role);
+    if (!roleId) throw new Error(`unknown role: ${input.role}`);
+    const result = await tx.query<{ id: string }>(
+      `INSERT INTO member_role_assignment
+         (member_id, role_id, scope_community_id, scope_space_id, granted_by_member_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [
+        input.memberId,
+        roleId,
+        input.scope.kind === "community" ? input.scope.communityId : null,
+        input.scope.kind === "project" ? input.scope.projectSpaceId : null,
+        input.grantedByMemberId,
+      ],
+    );
+    const assignmentId = result.rows[0].id;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.roleAssigned,
+      communityId: await scopeCommunityId(tx, input.scope),
+      actorMemberId: input.grantedByMemberId,
+      targetType: "member_role_assignment",
+      targetId: assignmentId,
+      metadata: { memberId: input.memberId, role: input.role },
+      correlationId: input.correlationId ?? randomUUID(),
+    });
+    return assignmentId;
+  });
 }
 
-/** Revoke an active assignment, retaining the row for audit. */
+/** Revoke an active assignment (retaining the row for audit), with typed audit. */
 export async function revokeRoleAssignment(
   client: DbClient,
   assignmentId: string,
   reason: string,
+  revokedByMemberId: string,
+  correlationId?: string,
 ): Promise<void> {
-  await client.query(
-    `UPDATE member_role_assignment
-     SET revoked_at = now(), revoked_reason = $2
-     WHERE id = $1 AND revoked_at IS NULL`,
-    [assignmentId, reason],
+  await inTransaction(client, async (tx) => {
+    const result = await tx.query<{
+      community_id: string | null;
+      scope_community_id: string | null;
+      scope_space_id: string | null;
+    }>(
+      `UPDATE member_role_assignment
+       SET revoked_at = now(), revoked_reason = $2
+       WHERE id = $1 AND revoked_at IS NULL
+       RETURNING scope_community_id, scope_space_id`,
+      [assignmentId, reason],
+    );
+    if (result.rows.length === 0) return;
+    const row = result.rows[0];
+    const communityId =
+      row.scope_community_id ??
+      (row.scope_space_id
+        ? (await tx.query<{ community_id: string }>(
+            "SELECT community_id FROM space WHERE id = $1",
+            [row.scope_space_id],
+          )).rows[0]?.community_id ?? null
+        : null);
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.roleRevoked,
+      communityId,
+      actorMemberId: revokedByMemberId,
+      targetType: "member_role_assignment",
+      targetId: assignmentId,
+      metadata: { reason },
+      correlationId: correlationId ?? randomUUID(),
+    });
+  });
+}
+
+async function scopeCommunityId(
+  client: DbClient,
+  scope: RoleAssignmentInput["scope"],
+): Promise<string> {
+  if (scope.kind === "community") return scope.communityId;
+  const result = await client.query<{ community_id: string }>(
+    "SELECT community_id FROM space WHERE id = $1",
+    [scope.projectSpaceId],
   );
+  if (result.rows.length === 0) throw new Error("project scope space not found");
+  return result.rows[0].community_id;
 }

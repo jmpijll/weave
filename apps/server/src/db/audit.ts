@@ -1,5 +1,25 @@
 import type { PoolClient } from "pg";
 
+/**
+ * The typed M1 audit vocabulary. Every state-changing command writes exactly one
+ * of these event types in the same transaction as the mutation it evidences.
+ */
+export const AUDIT_EVENT = {
+  memberAdmitted: "member.admission",
+  spaceCreated: "space.create",
+  spaceAccessGrant: "space.access.grant",
+  spaceAccessRevoke: "space.access.revoke",
+  roleAssigned: "role.assigned",
+  roleRevoked: "role.revoked",
+  admissionInviteIssued: "community.admission.invite.issued",
+  admissionInviteRevoked: "community.admission.invite.revoked",
+  spaceInviteIssued: "space.invite.issued",
+  spaceInviteAccepted: "space.invite.accepted",
+  spaceInviteRevoked: "space.invite.revoked",
+} as const;
+
+export type AuditEventType = (typeof AUDIT_EVENT)[keyof typeof AUDIT_EVENT];
+
 export interface AuditEventInput {
   eventType: string;
   communityId?: string | null;

@@ -290,6 +290,42 @@ CREATE TABLE community_admission_invite (
 CREATE INDEX community_admission_invite_target_idx
   ON community_admission_invite (community_id, target_kind, state);
 
+-- A community-admission invite must target an active human root credential or
+-- an existing active agent, and be issued by an active member of the community.
+CREATE OR REPLACE FUNCTION enforce_community_admission_invite_target() RETURNS trigger AS $$
+DECLARE
+  issuer     member%ROWTYPE;
+  cred       credential%ROWTYPE;
+  agent_row  agent%ROWTYPE;
+  agent_cred credential%ROWTYPE;
+BEGIN
+  SELECT * INTO STRICT issuer FROM member WHERE id = NEW.issuer_member_id;
+  IF issuer.revoked_at IS NOT NULL OR issuer.community_id <> NEW.community_id THEN
+    RAISE EXCEPTION 'admission invite issuer must be an active member of the community';
+  END IF;
+
+  IF NEW.target_kind = 'human' THEN
+    SELECT * INTO STRICT cred FROM credential WHERE id = NEW.target_credential_id;
+    IF cred.kind <> 'human' OR cred.parent_credential_id IS NOT NULL OR cred.revoked_at IS NOT NULL THEN
+      RAISE EXCEPTION 'human admission invite must target an active human root credential';
+    END IF;
+  ELSE
+    SELECT * INTO STRICT agent_row FROM agent WHERE id = NEW.target_agent_id;
+    SELECT * INTO STRICT agent_cred FROM credential WHERE id = agent_row.credential_id;
+    IF agent_cred.revoked_at IS NOT NULL THEN
+      RAISE EXCEPTION 'agent admission invite must target an existing active agent';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER community_admission_invite_target_checks
+  BEFORE INSERT OR UPDATE OF community_id, issuer_member_id, target_kind, target_credential_id, target_agent_id
+  ON community_admission_invite
+  FOR EACH ROW
+  EXECUTE FUNCTION enforce_community_admission_invite_target();
+
 -- ---------------------------------------------------------------------------
 -- space_invite — targeted at an existing active member; never admits
 -- ---------------------------------------------------------------------------
@@ -310,11 +346,14 @@ CREATE TABLE space_invite (
 CREATE INDEX space_invite_target_idx
   ON space_invite (target_member_id, state);
 
--- A space invite must target an active member in the space's community.
+-- A space invite must target an active member of the space's community, point
+-- at a project root or a private descendant (never a public non-root node), and
+-- be issued by an active member of the same community.
 CREATE OR REPLACE FUNCTION enforce_space_invite_target() RETURNS trigger AS $$
 DECLARE
   member_row member%ROWTYPE;
   space_row  space%ROWTYPE;
+  issuer_row member%ROWTYPE;
 BEGIN
   SELECT * INTO STRICT member_row FROM member WHERE id = NEW.target_member_id;
   IF member_row.revoked_at IS NOT NULL OR member_row.community_id <> NEW.community_id THEN
@@ -324,12 +363,22 @@ BEGIN
   IF space_row.community_id <> NEW.community_id THEN
     RAISE EXCEPTION 'space invite must be within the community (cross-community denied)';
   END IF;
+  IF NOT (
+    (space_row.kind = 'project' AND space_row.parent_space_id IS NULL)
+    OR (space_row.kind <> 'project' AND space_row.visibility = 'private')
+  ) THEN
+    RAISE EXCEPTION 'space invite must target a project root or a private descendant';
+  END IF;
+  SELECT * INTO STRICT issuer_row FROM member WHERE id = NEW.issuer_member_id;
+  IF issuer_row.revoked_at IS NOT NULL OR issuer_row.community_id <> NEW.community_id THEN
+    RAISE EXCEPTION 'space invite issuer must be an active member of the community';
+  END IF;
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER space_invite_target_checks
-  BEFORE INSERT OR UPDATE OF target_member_id, space_id, community_id
+  BEFORE INSERT OR UPDATE OF target_member_id, space_id, community_id, issuer_member_id
   ON space_invite
   FOR EACH ROW
   EXECUTE FUNCTION enforce_space_invite_target();

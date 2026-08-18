@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import type { DbClient } from "./db-client.ts";
 
 /**
  * Run `work` on a single checked-out client inside one transaction. This is the
@@ -22,4 +23,20 @@ export async function withTransaction<T>(
   } finally {
     client.release();
   }
+}
+
+/**
+ * Run `work` on a connection that already participates in a transaction if it
+ * is a checked-out client, or start a fresh transaction when it is a `Pool`.
+ * A command that writes an audit record alongside its mutation must run through
+ * this helper so the two writes always commit or roll back together.
+ */
+export async function inTransaction<T>(
+  client: DbClient,
+  work: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  if ("release" in client) {
+    return work(client as PoolClient);
+  }
+  return withTransaction(client as Pool, work);
 }

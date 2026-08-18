@@ -4,8 +4,6 @@ import pg from "pg";
 import { randomBytes } from "node:crypto";
 import { createDatabaseConfig, createDatabasePool } from "../src/db/pool.ts";
 import { runMigrations } from "../src/db/migrate.ts";
-import { withTransaction } from "../src/db/transaction.ts";
-import { writeAuditEvent } from "../src/db/audit.ts";
 import { hasPermission, assignRole, revokeRoleAssignment } from "../src/domain/roles.ts";
 import { evaluateEffectiveAccess } from "../src/domain/access.ts";
 import { createMember } from "../src/domain/membership.ts";
@@ -15,7 +13,6 @@ import {
   acceptCommunityAdmissionInvite,
   issueSpaceInvite,
   acceptSpaceInvite,
-  transitionInvite,
 } from "../src/domain/invites.ts";
 
 const { Client } = pg;
@@ -336,7 +333,7 @@ test("project_owner assignment is scoped to a project root and effective per pro
       [guest.memberId, projectId],
     );
     assert.equal(assignment.rows.length, 1);
-    await revokeRoleAssignment(pool, assignment.rows[0].id, "test");
+    await revokeRoleAssignment(pool, assignment.rows[0].id, "test", admin.memberId);
     assert.equal(
       await hasPermission(pool, {
         actorMemberId: guest.memberId,
@@ -424,7 +421,7 @@ test("Pass 35: private project traversal, grant, subtree, and revoke", async () 
     );
 
     // Revoking the root grant denies the subtree, including public children.
-    await revokeSpaceMembership(p, projectId, guest.memberId, "test");
+    await revokeSpaceMembership(p, projectId, guest.memberId, "test", admin.memberId);
     assert.equal(
       (await evaluateEffectiveAccess(p, { actorMemberId: guest.memberId, targetSpaceId: projectId })).accessible,
       false,
@@ -628,42 +625,377 @@ test("space invite: targets an existing active member, never admits, and is term
   });
 });
 
-test("audit events attribute member-level authority and stay append-only", async () => {
+test("admission acceptance is a locked, once-only consume: revoked and expired invites cannot admit", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin } = await buildFixture(pool);
+    const outsider = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["outsider"])
+    ).rows[0].id;
+    const outsiderRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [outsider, "outsider-root"],
+      )
+    ).rows[0].id;
+
+    // A revoked invite is terminal: accepting it must be a no-op and admit nobody.
+    const revokedInvite = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+    await pool.query(
+      `UPDATE community_admission_invite SET state = 'revoked' WHERE id = $1`,
+      [revokedInvite],
+    );
+    assert.equal(await acceptCommunityAdmissionInvite(pool, revokedInvite), null);
+    assert.equal(
+      (await pool.query(
+        "SELECT count(*)::int AS n FROM member WHERE community_id = $1", [communityId],
+      )).rows[0].n,
+      2,
+      "a revoked admission invite must never admit a member",
+    );
+
+    // An expired invite is terminal in the same way.
+    const expiredInvite = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    assert.equal(await acceptCommunityAdmissionInvite(pool, expiredInvite), null);
+    assert.equal(
+      (await pool.query(
+        "SELECT count(*)::int AS n FROM member WHERE community_id = $1", [communityId],
+      )).rows[0].n,
+      2,
+      "an expired admission invite must never admit a member",
+    );
+
+    // A valid invite accepts exactly once: a second accept is a no-op.
+    const valid = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+    const accepted = await acceptCommunityAdmissionInvite(pool, valid);
+    assert.ok(accepted);
+    assert.equal(await acceptCommunityAdmissionInvite(pool, valid), null, "once-only consume");
+  });
+});
+
+test("admission and space invite targets and issuers are validated at the DB boundary", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
     const { communityId, admin, guest, projectId } = await buildFixture(pool);
 
-    const eventId = await withTransaction(pool, async (client) => {
-      await grantSpaceMembership(client, {
-        spaceId: projectId,
-        memberId: guest.memberId,
-        grantedByMemberId: admin.memberId,
-        source: "explicit",
-      });
-      return writeAuditEvent(client, {
-        eventType: "space.access.grant",
-        communityId,
-        actorMemberId: admin.memberId,
-        targetType: "space_membership",
-        targetId: projectId,
-        metadata: { granteeMemberId: guest.memberId },
-        correlationId: "corr-m1-2",
-      });
-    });
-
-    const row = await pool.query(
-      `SELECT event_type, actor_member_id, actor_person_id FROM audit_event WHERE id = $1`,
-      [eventId],
-    );
-    assert.equal(row.rows[0].event_type, "space.access.grant");
-    assert.equal(row.rows[0].actor_member_id, admin.memberId);
-
-    // audit is append-only
+    // A human admission invite must target an active human ROOT credential, not
+    // any credential: a device (kind=human with a parent) is rejected.
+    const deviceCredential = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+         VALUES ($1, $2, 'ed25519', 'human', $3) RETURNING id`,
+        [guest.personId, "guest-device", guest.rootCredentialId],
+      )
+    ).rows[0].id;
     await expectReject(
       pool,
-      "DELETE FROM audit_event WHERE id = $1",
-      [eventId],
-      "append-only",
+      `INSERT INTO community_admission_invite
+         (community_id, target_kind, target_credential_id, issuer_member_id, expires_at)
+       VALUES ($1, 'human', $2, $3, $4)`,
+      [communityId, deviceCredential, admin.memberId, new Date(Date.now() + 3600_000).toISOString()],
+      "active human root credential",
     );
+
+    // A revoked human root is also rejected (a fresh person whose root is revoked).
+    const revokedPerson = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["revoked person"])
+    ).rows[0].id;
+    const revokedRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [revokedPerson, "revoked-root"],
+      )
+    ).rows[0].id;
+    await pool.query(`UPDATE credential SET revoked_at = now() WHERE id = $1`, [revokedRoot]);
+    await expectReject(
+      pool,
+      `INSERT INTO community_admission_invite
+         (community_id, target_kind, target_credential_id, issuer_member_id, expires_at)
+       VALUES ($1, 'human', $2, $3, $4)`,
+      [communityId, revokedRoot, admin.memberId, new Date(Date.now() + 3600_000).toISOString()],
+      "active human root credential",
+    );
+
+    // A space invite must target a project root or private descendant: a public
+    // section is rejected.
+    const publicSection = (
+      await createSpace(pool, { communityId, kind: "section", parentSpaceId: projectId, visibility: "public", description: "s" })
+    ).id;
+    await expectReject(
+      pool,
+      `INSERT INTO space_invite
+         (community_id, target_member_id, space_id, issuer_member_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [communityId, guest.memberId, publicSection, admin.memberId, new Date(Date.now() + 3600_000).toISOString()],
+      "project root or a private descendant",
+    );
+    // ... but a private descendant is accepted.
+    const privateSection = (
+      await createSpace(pool, { communityId, kind: "section", parentSpaceId: projectId, visibility: "private", description: "ps" })
+    ).id;
+    await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: privateSection,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+
+    // A cross-community issuer is rejected for a space invite.
+    const otherCommunity = (
+      await pool.query(
+        `INSERT INTO community (canonical_tls_origin, name) VALUES ($1, $2) RETURNING id`,
+        ["https://other.example", "Other"],
+      )
+    ).rows[0].id;
+    const otherMember = await createMember(pool, {
+      communityId: otherCommunity,
+      subject: {
+        kind: "human",
+        personId: (await pool.query(
+          "INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["other"],
+        )).rows[0].id,
+      },
+    });
+    await expectReject(
+      pool,
+      `INSERT INTO space_invite
+         (community_id, target_member_id, space_id, issuer_member_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [communityId, guest.memberId, projectId, otherMember.id, new Date(Date.now() + 3600_000).toISOString()],
+      "space invite issuer must be an active member of the community",
+    );
+
+    // A space invite issued by a revoked member is rejected.
+    const willBeRevoked = await createMember(pool, {
+      communityId,
+      subject: {
+        kind: "human",
+        personId: (await pool.query(
+          "INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["willrevoke"],
+        )).rows[0].id,
+      },
+    });
+    await pool.query(`UPDATE member SET revoked_at = now(), revoked_reason = 't' WHERE id = $1`, [willBeRevoked.id]);
+    await expectReject(
+      pool,
+      `INSERT INTO space_invite
+         (community_id, target_member_id, space_id, issuer_member_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [communityId, guest.memberId, projectId, willBeRevoked.id, new Date(Date.now() + 3600_000).toISOString()],
+      "space invite issuer must be an active member of the community",
+    );
+  });
+});
+
+test("authorization matrix: every capability is identical for assigned human and agent, denied when unassigned", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    // Two dedicated role holders: one human member and one agent member.
+    const humanHolder = await createMember(pool, {
+      communityId,
+      subject: {
+        kind: "human",
+        personId: (await pool.query(
+          "INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["human holder"],
+        )).rows[0].id,
+      },
+    });
+    const agentOwner = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["agent owner"])
+    ).rows[0].id;
+    const agentRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [agentOwner, "aowner-root"],
+      )
+    ).rows[0].id;
+    const agentHostCred = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+         VALUES ($1, $2, 'ed25519', 'host', $3) RETURNING id`,
+        [agentOwner, "aowner-host", agentRoot],
+      )
+    ).rows[0].id;
+    const agentHost = (
+      await pool.query(
+        `INSERT INTO host (owner_person_id, credential_id) VALUES ($1, $2) RETURNING id`,
+        [agentOwner, agentHostCred],
+      )
+    ).rows[0].id;
+    const agentCred = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+         VALUES ($1, $2, 'ed25519', 'agent', $3) RETURNING id`,
+        [agentOwner, "aowner-agent", agentHostCred],
+      )
+    ).rows[0].id;
+    const agent = (
+      await pool.query(
+        `INSERT INTO agent (host_id, credential_id) VALUES ($1, $2) RETURNING id`,
+        [agentHost, agentCred],
+      )
+    ).rows[0].id;
+    const agentHolder = await createMember(pool, {
+      communityId,
+      subject: { kind: "agent", agentId: agent },
+    });
+
+    // Give both holders every M1 bootstrap role at the matching scope.
+    for (const holder of [humanHolder.id, agentHolder.id]) {
+      await assignRole(pool, {
+        memberId: holder,
+        role: "community_admin",
+        scope: { kind: "community", communityId },
+        grantedByMemberId: admin.memberId,
+      });
+      await assignRole(pool, {
+        memberId: holder,
+        role: "project_owner",
+        scope: { kind: "project", projectSpaceId: projectId },
+        grantedByMemberId: admin.memberId,
+      });
+      await assignRole(pool, {
+        memberId: holder,
+        role: "recovery_operator",
+        scope: { kind: "community", communityId },
+        grantedByMemberId: admin.memberId,
+      });
+    }
+
+    // Every matrix capability: assigned human, assigned agent, and the
+    // equivalent unassigned member (guest) — one combined evidence row.
+    const cases = [
+      { capability: "community.members.manage", scope: { kind: "community", communityId } },
+      { capability: "community.projects.create", scope: { kind: "community", communityId } },
+      { capability: "roles.assign", scope: { kind: "community", communityId } },
+      { capability: "project.spaces.manage", scope: { kind: "project", projectSpaceId: projectId } },
+      { capability: "project.access.manage", scope: { kind: "project", projectSpaceId: projectId } },
+      { capability: "project.invites.manage", scope: { kind: "project", projectSpaceId: projectId } },
+      { capability: "identity.recover", scope: { kind: "community", communityId } },
+    ] as const;
+
+    for (const { capability, scope } of cases) {
+      assert.equal(
+        await hasPermission(pool, { actorMemberId: humanHolder.id, permission: capability, scope }),
+        true,
+        `assigned human must hold ${capability}`,
+      );
+      assert.equal(
+        await hasPermission(pool, { actorMemberId: agentHolder.id, permission: capability, scope }),
+        true,
+        `assigned agent must hold ${capability}`,
+      );
+      assert.equal(
+        await hasPermission(pool, { actorMemberId: guest.memberId, permission: capability, scope }),
+        false,
+        `unassigned member must be denied ${capability}`,
+      );
+    }
+  });
+});
+
+test("grant and revoke commands write their own typed audit in the same transaction", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    // GrantSpaceMembership emits space.access.grant itself.
+    await grantSpaceMembership(pool, {
+      spaceId: projectId,
+      memberId: guest.memberId,
+      grantedByMemberId: admin.memberId,
+      source: "explicit",
+    });
+    const grants = await pool.query(
+      `SELECT event_type, actor_member_id, community_id FROM audit_event
+       WHERE event_type = $1 AND metadata->>'memberId' = $2 ORDER BY created_at`,
+      ["space.access.grant", guest.memberId],
+    );
+    assert.equal(grants.rows.length, 1);
+    assert.equal(grants.rows[0].actor_member_id, admin.memberId);
+    assert.equal(grants.rows[0].community_id, communityId);
+
+    // RevokeSpaceMembership emits space.access.revoke with the acting member.
+    await revokeSpaceMembership(pool, projectId, guest.memberId, "test", admin.memberId);
+    const revokes = await pool.query(
+      `SELECT event_type, actor_member_id FROM audit_event
+       WHERE event_type = $1 AND metadata->>'memberId' = $2 ORDER BY created_at`,
+      ["space.access.revoke", guest.memberId],
+    );
+    assert.equal(revokes.rows.length, 1);
+    assert.equal(revokes.rows[0].actor_member_id, admin.memberId);
+
+    // audit is append-only
+    const firstEvent = (
+      await pool.query(`SELECT id FROM audit_event ORDER BY created_at LIMIT 1`)
+    ).rows[0].id;
+    await expectReject(pool, "DELETE FROM audit_event WHERE id = $1", [firstEvent], "append-only");
+  });
+});
+
+test("createSpace with a root grant is atomic: a failing grant leaves no project behind", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin } = await buildFixture(pool);
+
+    // A revoked member cannot receive a grant (space_membership trigger), so the
+    // combined create+grant must roll back entirely and create no project.
+    const revokedMember = await createMember(pool, {
+      communityId,
+      subject: {
+        kind: "human",
+        personId: (await pool.query(
+          "INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["revoked"],
+        )).rows[0].id,
+      },
+    });
+    await pool.query(
+      `UPDATE member SET revoked_at = now(), revoked_reason = 'test' WHERE id = $1`,
+      [revokedMember.id],
+    );
+
+    const before = (await pool.query("SELECT count(*)::int AS n FROM space")).rows[0].n;
+    const grantAuditBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["space.access.grant"],
+    )).rows[0].n;
+    await assert.rejects(
+      createSpace(pool, {
+        communityId,
+        kind: "project",
+        visibility: "private",
+        ownerMemberId: admin.memberId,
+      }, { memberId: revokedMember.id, grantedByMemberId: admin.memberId }),
+      (error: unknown) =>
+        error instanceof Error && /requires an active member/.test(error.message),
+    );
+    const after = (await pool.query("SELECT count(*)::int AS n FROM space")).rows[0].n;
+    assert.equal(after, before, "a failed root grant must not leave a partial project");
+    const grantAuditAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["space.access.grant"],
+    )).rows[0].n;
+    assert.equal(grantAuditAfter, grantAuditBefore, "no grant audit may be written for a rolled-back grant");
   });
 });
