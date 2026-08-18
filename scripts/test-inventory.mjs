@@ -13,6 +13,7 @@
  *   4. evidence-contract.test.mjs       evidence contract regression (script)
  *   5. node-runtime-regression.test.mjs installer Node floor regression (script)
  *   6. t4-codex-delivery-contract.test.mjs T4 delivery contract (node:test)
+ *   7. m1r-recovery-poc-contract.test.mjs test-only recovery POC contract
  *
  * Each layer runs as its own child process with the pinned `node` binary
  * (process.execPath), so a failure is isolated and attributable. A non-zero
@@ -31,6 +32,7 @@ const INVENTORY = [
   { name: "evidence-contract.test.mjs", args: ["scripts/evidence-contract.test.mjs"] },
   { name: "node-runtime-regression.test.mjs", args: ["scripts/node-runtime-regression.test.mjs"] },
   { name: "t4-codex-delivery-contract.test.mjs", args: ["--test", "scripts/t4-codex-delivery-contract.test.mjs"] },
+  { name: "m1r-recovery-poc-contract.test.mjs", args: ["--test", "scripts/m1r-recovery-poc-contract.test.mjs"] },
 ];
 
 let failed = 0;

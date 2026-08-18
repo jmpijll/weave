@@ -1,0 +1,55 @@
+{
+  "fixture": "weave-recovery-poc-adversarial-v1",
+  "classification": "secret-free-state-and-adversarial-fixture",
+  "contains": ["public-verifiers", "challenge-selectors", "canonical-transcript", "raw-signatures", "expected-results", "audit-types"],
+  "containsNo": ["mnemonic-value", "entropy-value", "ikm-value", "private-key", "seed", "chain-code", "reversible-export"],
+  "serverConfiguration": {
+    "environment": "test",
+    "environmentCode": 4,
+    "canonicalTlsOrigin": "wss://recovery-poc.invalid:8443",
+    "maxChallengeLifetimeMs": "900000"
+  },
+  "storedState": {
+    "personId": "00112233-4455-6677-8899-aabbccddeeff",
+    "communityId": "11111111-2222-3333-4444-555555555555",
+    "recoveryVerifierId": "10213243-5465-7687-98a9-bacbdcedfe0f",
+    "rootPublicKeyHex": "3b78e104fc84de1dcebad27385d47c99fbe24f167ef6390304e2c08fb36463b1",
+    "recoveryVerifierPublicKeyHex": "2e7527137152878e7a6bced5d3a30b1e0d4bd1f705173fa7b026779e4cc76640",
+    "algorithm": "ed25519",
+    "schemeVersion": 1,
+    "environment": "test"
+  },
+  "issuedChallenge": {
+    "challengeId": "abcdefab-cdef-4abc-8def-abcdefabcdef",
+    "tlsOrigin": "wss://recovery-poc.invalid:8443",
+    "personId": "00112233-4455-6677-8899-aabbccddeeff",
+    "recoveryVerifierId": "10213243-5465-7687-98a9-bacbdcedfe0f",
+    "communityId": "11111111-2222-3333-4444-555555555555",
+    "environment": "test",
+    "environmentCode": 4,
+    "nonceHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "intendedDevicePublicKeyHex": "9f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "canonicalTranscriptHex": "001477656176652f7265636f766572792f70726f6f66000100010401001f7773733a2f2f7265636f766572792d706f632e696e76616c69643a3834343300112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f11111111222233334444555555555555abcdefabcdef4abc8defabcdefabcdef000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f9f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f000001b8dac5b400",
+    "rootSignatureHex": "da937dad825ec65e4fc2253dd34d5d30138d73d2f71f4f445a18832be937a9a5f44571b56236df4c26316fd770681073b5e59e782cc536f6d033423b6e96340d",
+    "recoveryProofSignatureHex": "4f39c0d6b74db27ca79c717a930b9a966911721827e5bbaa61d8398a52545ccfec6ba99eee20e868c4218eb87c0d89ab303a25ad2966ca0e86661922754fbb05",
+    "expiryUnixMs": "1893456000000",
+    "consumedAt": null
+  },
+  "cases": [
+    {"id":"valid-first-submit","expected":"accepted_once","auditType":"recovery_secret_proven_enrollment"},
+    {"id":"root-only-proof","expected":"recovery_proof_invalid","auditType":null},
+    {"id":"mutated-transcript","expected":"transcript_invalid","auditType":null},
+    {"id":"expired-challenge","expected":"challenge_expired","auditType":null},
+    {"id":"origin-substitution","expected":"origin_mismatch","auditType":null},
+    {"id":"community-substitution","expected":"stored_state_mismatch","auditType":null},
+    {"id":"device-substitution","expected":"stored_state_mismatch","auditType":null},
+    {"id":"environment-triple-mismatch","expected":"environment_mismatch","auditType":null},
+    {"id":"unknown-or-malformed-parser-field","expected":"transcript_invalid","auditType":null},
+    {"id":"replayed-consumed-challenge","expected":"challenge_consumed","auditType":null},
+    {"id":"concurrent-double-consume","expected":"exactly_one_commit","auditType":"recovery_secret_proven_enrollment"},
+    {"id":"root-only-verifier-transition","expected":"recovery_proof_required","auditType":null},
+    {"id":"atomic-admin-rebind","expected":"atomic_rebind_or_rollback","auditType":"identity_recovery"},
+    {"id":"root-authorized-device-enrollment-audit","expected":"distinct_audit_type","auditType":"root_authorized_device_enrollment"},
+    {"id":"credential-revocation-audit","expected":"distinct_audit_type","auditType":"credential_revocation"}
+  ]
+}
