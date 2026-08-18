@@ -95,7 +95,7 @@ const listening = new Promise((resolveListening, rejectListening) => {
   }, 15_000);
   const onData = (chunk) => {
     output += chunk.toString();
-    const match = output.match(/health endpoint listening at http:\/\/127\.0\.0\.1:(\d+)/);
+    const match = output.match(/"event":"http\.listening".*?"port":(\d+)/);
     if (match) {
       clearTimeout(timer);
       resolveListening(Number(match[1]));

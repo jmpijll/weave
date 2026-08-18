@@ -73,7 +73,7 @@ export function startWeaveServer(port: number = DEFAULT_PORT, options: ServerOpt
     const address = server.address();
     const bound =
       typeof address === "object" && address !== null ? address.port : port;
-    console.log(`[weave-server] health endpoint listening at http://127.0.0.1:${bound}`);
+    logEvent("http.listening", { host: "127.0.0.1", port: bound });
   });
   return { server, pool: options.pool };
 }
@@ -112,7 +112,7 @@ if (import.meta.main) {
   const shutdown = () => {
     if (closing) return;
     closing = true;
-    console.log("[weave-server] received shutdown signal, closing");
+    logEvent("shutdown.signal", { reason: "closing" });
     server.closeIdleConnections?.();
     server.close(async () => {
       await pool?.end();

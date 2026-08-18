@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import pg from "pg";
 import { randomBytes } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   MigrationError,
   runMigrations,
@@ -16,10 +19,10 @@ const { Client } = pg;
 const BASE_URL = process.env.DATABASE_URL ?? "";
 
 if (!BASE_URL) {
-  console.log(
-    "m1-1 migrations integration: SKIP (DATABASE_URL not set; start a disposable PostgreSQL 16 and set DATABASE_URL to exercise this layer)",
+  console.error(
+    "m1-1 migrations integration: FAIL (DATABASE_URL not set; start a disposable PostgreSQL 16 and set DATABASE_URL — M1.1 migration and credential-tree evidence is mandatory and a skip is not acceptance)",
   );
-  process.exit(0);
+  process.exit(1);
 }
 
 let dbCounter = 0;
@@ -304,6 +307,125 @@ test("Postgres enforces the Pass 40/41 credential-tree shape", async () => {
   });
 });
 
+test("a revoked root blocks a new agent under an existing unrevoked host", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+
+    const p1 = (await pool.query(
+      "INSERT INTO person (display_name) VALUES ($1) RETURNING id",
+      ["person-revoked-root"],
+    )).rows[0].id;
+    const root = (await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind)
+       VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+      [p1, "root-pub"],
+    )).rows[0].id;
+    const hostCred = (await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+       VALUES ($1, $2, 'ed25519', 'host', $3) RETURNING id`,
+      [p1, "host-pub", root],
+    )).rows[0].id;
+
+    // The unrevoked host sits under a now-revoked root and still passes the
+    // direct-parent check; the full ancestor walk must deny the new agent.
+    await pool.query(
+      "UPDATE credential SET revoked_at = now(), revoked_reason = 'compromise' WHERE id = $1",
+      [root],
+    );
+    await expectReject(
+      pool,
+      `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+       VALUES ($1, $2, 'ed25519', 'agent', $3)`,
+      [p1, "agent-under-revoked-root", hostCred],
+      "revoked ancestor",
+    );
+  });
+});
+
+test("credential updates revalidate host, agent, and child dependents", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+
+    const p1 = (await pool.query(
+      "INSERT INTO person (display_name) VALUES ($1) RETURNING id",
+      ["person-dependents"],
+    )).rows[0].id;
+    const root = (await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind)
+       VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+      [p1, "root-pub"],
+    )).rows[0].id;
+
+    const hostCred = (await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+       VALUES ($1, $2, 'ed25519', 'host', $3) RETURNING id`,
+      [p1, "host1-pub", root],
+    )).rows[0].id;
+    const hostCred2 = (await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+       VALUES ($1, $2, 'ed25519', 'host', $3) RETURNING id`,
+      [p1, "host2-pub", root],
+    )).rows[0].id;
+    const agentCred = (await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+       VALUES ($1, $2, 'ed25519', 'agent', $3) RETURNING id`,
+      [p1, "agent1-pub", hostCred],
+    )).rows[0].id;
+
+    const host1 = (await pool.query(
+      `INSERT INTO host (owner_person_id, credential_id) VALUES ($1, $2) RETURNING id`,
+      [p1, hostCred],
+    )).rows[0].id;
+    await pool.query(
+      `INSERT INTO host (owner_person_id, credential_id) VALUES ($1, $2)`,
+      [p1, hostCred2],
+    );
+    await pool.query(
+      `INSERT INTO agent (host_id, credential_id) VALUES ($1, $2)`,
+      [host1, agentCred],
+    );
+
+    // (a) Re-pointing an already-bound agent's credential to a different
+    // same-person host would make the recorded host and the credential chain
+    // disagree; only the dependent trigger can see that.
+    await expectReject(
+      pool,
+      "UPDATE credential SET parent_credential_id = $1 WHERE id = $2",
+      [hostCred2, agentCred],
+      "cross-host after update",
+    );
+
+    // (b) Mutating an already-bound host credential (kind) must be rejected so
+    // `host.owner_person_id` and the credential chain cannot diverge.
+    await expectReject(
+      pool,
+      "UPDATE credential SET kind = 'human' WHERE id = $1",
+      [hostCred],
+      "references a non-host credential",
+    );
+
+    // (c) A child credential under a parent whose mutation invalidates its
+    // placement is caught by the child revalidation loop (no host/agent record
+    // involved here, so only the dependent child check can reject it).
+    const hostBare = (await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+       VALUES ($1, $2, 'ed25519', 'host', $3) RETURNING id`,
+      [p1, "host-bare-pub", root],
+    )).rows[0].id;
+    await pool.query(
+      `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+       VALUES ($1, $2, 'ed25519', 'agent', $3)`,
+      [p1, "agent-bare-pub", hostBare],
+    );
+    await expectReject(
+      pool,
+      "UPDATE credential SET kind = 'human' WHERE id = $1",
+      [hostBare],
+      "agent must parent only to a host credential",
+    );
+  });
+});
+
 test("audit_event is append-only", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
@@ -331,5 +453,43 @@ test("audit_event is append-only", async () => {
       [audit.rows[0].id],
       "append-only",
     );
+  });
+});
+
+test("migration runner refuses duplicate versions in the migration set", async () => {
+  await withFreshDatabase(async (pool) => {
+    const dir = await mkdtemp(join(tmpdir(), "weave-m1-dup-"));
+    try {
+      await writeFile(join(dir, "0001_a.sql"), "CREATE TABLE dup_a (id int);");
+      await writeFile(join(dir, "0001_b.sql"), "CREATE TABLE dup_b (id int);");
+      await assert.rejects(runMigrations(pool, { migrationsDir: dir }), (error: unknown) => {
+        assert.ok(error instanceof MigrationError);
+        assert.match(error.message, /duplicate migration version/);
+        return true;
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("migration runner refuses a backfilled lower-numbered pending migration", async () => {
+  await withFreshDatabase(async (pool) => {
+    const dir = await mkdtemp(join(tmpdir(), "weave-m1-backfill-"));
+    try {
+      await writeFile(join(dir, "0002_second.sql"), "CREATE TABLE second_table (id int);");
+      const first = await runMigrations(pool, { migrationsDir: dir });
+      assert.deepEqual(first.applied, [2]);
+
+      // A newly introduced version 1 must not run after version 2 is applied.
+      await writeFile(join(dir, "0001_first.sql"), "CREATE TABLE first_table (id int);");
+      await assert.rejects(runMigrations(pool, { migrationsDir: dir }), (error: unknown) => {
+        assert.ok(error instanceof MigrationError);
+        assert.match(error.message, /forward-only violated/);
+        return true;
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

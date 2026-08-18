@@ -97,7 +97,16 @@ export async function runMigrations(
     }
 
     const byVersion = new Map<number, PendingMigration>();
-    for (const file of files) byVersion.set(file.version, file);
+    const seenVersions = new Set<number>();
+    for (const file of files) {
+      if (seenVersions.has(file.version)) {
+        throw new MigrationError(
+          `duplicate migration version: ${file.version} is defined by more than one file`,
+        );
+      }
+      seenVersions.add(file.version);
+      byVersion.set(file.version, file);
+    }
 
     // Fail closed on future or changed history before applying anything new.
     for (const [version, checksum] of applied) {
@@ -110,6 +119,19 @@ export async function runMigrations(
       if (file.checksum !== checksum) {
         throw new MigrationError(
           `migration history changed: applied migration ${version} checksum differs from its file`,
+        );
+      }
+    }
+
+    // Forward-only: no pending version may be at or below the greatest applied
+    // version, so a backfilled lower-numbered migration can never run out of
+    // order after a higher version is already on disk.
+    const maxApplied = applied.size > 0 ? Math.max(...applied.keys()) : 0;
+    for (const file of files) {
+      if (applied.has(file.version)) continue;
+      if (file.version <= maxApplied) {
+        throw new MigrationError(
+          `forward-only violated: pending migration ${file.version} is at or below the greatest applied version ${maxApplied}`,
         );
       }
     }
