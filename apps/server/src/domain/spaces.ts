@@ -8,6 +8,8 @@ export type Visibility = "public" | "private";
 
 export interface SpaceInput {
   communityId: string;
+  /** The authenticated actor performing the space mutation (audit actor). */
+  createdByMemberId: string;
   kind: SpaceKind;
   parentSpaceId?: string | null;
   ownerMemberId?: string | null;
@@ -24,16 +26,17 @@ export interface SpaceRecord {
 /**
  * Create a space node. The DB triggers enforce project-root-only and the
  * project > section > channel > thread parent kind/depth and same-community
- * rules. When `withRootGrantFor` is supplied (project creation) the space
- * insert, the creator's explicit project-root access grant, and their typed
- * audit records are applied in one transaction, so a failing grant can never
- * leave a project behind.
+ * rules. Every successful mutation records a typed `space.create` audit with the
+ * acting creator; when `withRootGrantFor` is supplied (project creation) the
+ * space insert, the creator's explicit project-root access grant, and all audit
+ * records are applied in one transaction, so a failing grant can never leave a
+ * project behind.
  */
 export async function createSpace(
   client: DbClient,
   input: SpaceInput,
-  withRootGrantFor?: { memberId: string; grantedByMemberId: string },
-  correlationId?: string,
+  withRootGrantFor: { memberId: string; grantedByMemberId: string } | undefined,
+  correlationId: string,
 ): Promise<SpaceRecord> {
   return inTransaction(client, async (tx) => {
     const result = await tx.query<{ id: string; kind: string; visibility: string }>(
@@ -51,24 +54,23 @@ export async function createSpace(
     );
     const id = result.rows[0].id;
     if (withRootGrantFor) {
-      const cid = correlationId ?? randomUUID();
       await grantSpaceMembership(tx, {
         spaceId: id,
         memberId: withRootGrantFor.memberId,
         grantedByMemberId: withRootGrantFor.grantedByMemberId,
         source: "explicit",
-        correlationId: cid,
-      });
-      await writeAuditEvent(tx, {
-        eventType: AUDIT_EVENT.spaceCreated,
-        communityId: input.communityId,
-        actorMemberId: withRootGrantFor.grantedByMemberId,
-        targetType: "space",
-        targetId: id,
-        metadata: { kind: input.kind, visibility: input.visibility },
-        correlationId: cid,
+        correlationId,
       });
     }
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.spaceCreated,
+      communityId: input.communityId,
+      actorMemberId: input.createdByMemberId,
+      targetType: "space",
+      targetId: id,
+      metadata: { kind: input.kind, visibility: input.visibility },
+      correlationId,
+    });
     return { id, kind: result.rows[0].kind as SpaceKind, visibility: result.rows[0].visibility as Visibility };
   });
 }

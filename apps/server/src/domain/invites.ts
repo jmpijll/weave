@@ -15,6 +15,7 @@ export interface AdmissionInviteInput {
     | { kind: "agent"; targetAgentId: string };
   issuerMemberId: string;
   expiresAt: string;
+  correlationId: string;
 }
 
 export interface SpaceInviteInput {
@@ -23,50 +24,84 @@ export interface SpaceInviteInput {
   spaceId: string;
   issuerMemberId: string;
   expiresAt: string;
+  correlationId: string;
 }
 
+/**
+ * Issue a community-admission invite. The insert and the typed issued-audit
+ * event run in one transaction; the issuer is the recorded actor.
+ */
 export async function issueCommunityAdmissionInvite(
   client: DbClient,
   input: AdmissionInviteInput,
 ): Promise<string> {
-  const result = await client.query<{ id: string }>(
-    `INSERT INTO community_admission_invite
-       (community_id, target_kind, target_credential_id, target_agent_id, issuer_member_id, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING id`,
-    [
-      input.communityId,
-      input.target.kind,
-      input.target.kind === "human" ? input.target.targetCredentialId : null,
-      input.target.kind === "agent" ? input.target.targetAgentId : null,
-      input.issuerMemberId,
-      input.expiresAt,
-    ],
-  );
-  return result.rows[0].id;
+  return inTransaction(client, async (tx) => {
+    const result = await tx.query<{ id: string }>(
+      `INSERT INTO community_admission_invite
+         (community_id, target_kind, target_credential_id, target_agent_id, issuer_member_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
+      [
+        input.communityId,
+        input.target.kind,
+        input.target.kind === "human" ? input.target.targetCredentialId : null,
+        input.target.kind === "agent" ? input.target.targetAgentId : null,
+        input.issuerMemberId,
+        input.expiresAt,
+      ],
+    );
+    const id = result.rows[0].id;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.admissionInviteIssued,
+      communityId: input.communityId,
+      actorMemberId: input.issuerMemberId,
+      targetType: "community_admission_invite",
+      targetId: id,
+      metadata: { targetKind: input.target.kind },
+      correlationId: input.correlationId,
+    });
+    return id;
+  });
 }
 
+/**
+ * Issue a space invite. The insert and the typed issued-audit event run in one
+ * transaction; the issuer is the recorded actor.
+ */
 export async function issueSpaceInvite(
   client: DbClient,
   input: SpaceInviteInput,
 ): Promise<string> {
-  const result = await client.query<{ id: string }>(
-    `INSERT INTO space_invite
-       (community_id, target_member_id, space_id, issuer_member_id, expires_at)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING id`,
-    [input.communityId, input.targetMemberId, input.spaceId, input.issuerMemberId, input.expiresAt],
-  );
-  return result.rows[0].id;
+  return inTransaction(client, async (tx) => {
+    const result = await tx.query<{ id: string }>(
+      `INSERT INTO space_invite
+         (community_id, target_member_id, space_id, issuer_member_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [input.communityId, input.targetMemberId, input.spaceId, input.issuerMemberId, input.expiresAt],
+    );
+    const id = result.rows[0].id;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.spaceInviteIssued,
+      communityId: input.communityId,
+      actorMemberId: input.issuerMemberId,
+      targetType: "space_invite",
+      targetId: id,
+      metadata: { spaceId: input.spaceId, targetMemberId: input.targetMemberId },
+      correlationId: input.correlationId,
+    });
+    return id;
+  });
 }
 
 /**
  * Transition an invite (admission or space) to a terminal state. Returns the
  * number of rows actually transitioned (0 when the invite is no longer
- * `issued`, e.g. already consumed or terminal). Callers that require an atomic
- * consume MUST assert the returned count is exactly 1.
+ * `issued`, e.g. already consumed or terminal). Private: every externally
+ * reachable transition must go through an audited command (accept/revoke),
+ * never through this raw helper.
  */
-export async function transitionInvite(
+async function transitionInvite(
   client: DbClient,
   table: "community_admission_invite" | "space_invite",
   inviteId: string,
@@ -80,6 +115,72 @@ export async function transitionInvite(
     [inviteId, to],
   );
   return result.rowCount ?? 0;
+}
+
+/**
+ * Revoke a community-admission invite. Returns false when the invite was
+ * already terminal (no transition, no audit); otherwise the revocation and its
+ * typed audit commit together.
+ */
+export async function revokeCommunityAdmissionInvite(
+  client: DbClient,
+  inviteId: string,
+  actorMemberId: string,
+  reason: string,
+  correlationId: string,
+): Promise<boolean> {
+  return inTransaction(client, async (tx) => {
+    const info = await tx.query<{ community_id: string }>(
+      "SELECT community_id FROM community_admission_invite WHERE id = $1",
+      [inviteId],
+    );
+    if (info.rows.length === 0) return false;
+    const transitioned = await transitionInvite(tx, "community_admission_invite", inviteId, "revoked");
+    if (transitioned !== 1) return false;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.admissionInviteRevoked,
+      communityId: info.rows[0].community_id,
+      actorMemberId,
+      targetType: "community_admission_invite",
+      targetId: inviteId,
+      metadata: { reason },
+      correlationId,
+    });
+    return true;
+  });
+}
+
+/**
+ * Revoke a space invite. Returns false when the invite was already terminal (no
+ * transition, no audit); otherwise the revocation and its typed audit commit
+ * together.
+ */
+export async function revokeSpaceInvite(
+  client: DbClient,
+  inviteId: string,
+  actorMemberId: string,
+  reason: string,
+  correlationId: string,
+): Promise<boolean> {
+  return inTransaction(client, async (tx) => {
+    const info = await tx.query<{ community_id: string }>(
+      "SELECT community_id FROM space_invite WHERE id = $1",
+      [inviteId],
+    );
+    if (info.rows.length === 0) return false;
+    const transitioned = await transitionInvite(tx, "space_invite", inviteId, "revoked");
+    if (transitioned !== 1) return false;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.spaceInviteRevoked,
+      communityId: info.rows[0].community_id,
+      actorMemberId,
+      targetType: "space_invite",
+      targetId: inviteId,
+      metadata: { reason },
+      correlationId,
+    });
+    return true;
+  });
 }
 
 /**
@@ -168,6 +269,7 @@ export async function acceptSpaceInvite(
       memberId: row.target_member_id,
       grantedByMemberId: row.issuer_member_id,
       source: "invite",
+      correlationId: correlationId ?? randomUUID(),
     });
     const transitioned = await transitionInvite(tx, "space_invite", inviteId, "accepted");
     if (transitioned !== 1) {

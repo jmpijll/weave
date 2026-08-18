@@ -11,8 +11,10 @@ import { createSpace, grantSpaceMembership, revokeSpaceMembership } from "../src
 import {
   issueCommunityAdmissionInvite,
   acceptCommunityAdmissionInvite,
+  revokeCommunityAdmissionInvite,
   issueSpaceInvite,
   acceptSpaceInvite,
+  revokeSpaceInvite,
 } from "../src/domain/invites.ts";
 
 const { Client } = pg;
@@ -80,6 +82,12 @@ interface FixturePerson {
   agentId: string;
   agentCredentialId: string;
   hostCredentialId: string;
+}
+
+let corrCounter = 0;
+function corr(label: string): string {
+  corrCounter += 1;
+  return `m1-2:${label}:${process.pid}:${corrCounter}`;
 }
 
 interface Fixture {
@@ -165,11 +173,12 @@ async function buildFixture(pool: pg.Pool): Promise<Fixture> {
   const projectId = (
     await createSpace(pool, {
       communityId,
+      createdByMemberId: admin.memberId,
       kind: "project",
       visibility: "private",
       ownerMemberId: admin.memberId,
       description: "root project",
-    }, { memberId: admin.memberId, grantedByMemberId: admin.memberId })
+    }, { memberId: admin.memberId, grantedByMemberId: admin.memberId }, corr("fixture-project"))
   ).id;
 
   return { pool, communityId, admin, guest, projectId };
@@ -314,11 +323,12 @@ test("project_owner assignment is scoped to a project root and effective per pro
     const otherProject = (
       await createSpace(pool, {
         communityId,
+        createdByMemberId: admin.memberId,
         kind: "project",
         visibility: "private",
         ownerMemberId: admin.memberId,
         description: "other",
-      }, { memberId: admin.memberId, grantedByMemberId: admin.memberId })
+      }, { memberId: admin.memberId, grantedByMemberId: admin.memberId }, corr("other-project"))
     ).id;
     const result = await hasPermission(pool, {
       actorMemberId: guest.memberId,
@@ -375,13 +385,13 @@ test("Pass 35: private project traversal, grant, subtree, and revoke", async () 
 
     // Ordinary subtree: a public section and channel inherit the project grant.
     const section = (
-      await createSpace(p, { communityId, kind: "section", parentSpaceId: projectId, visibility: "public", description: "s" })
+      await createSpace(p, { communityId, createdByMemberId: admin.memberId, kind: "section", parentSpaceId: projectId, visibility: "public", description: "s" }, undefined, corr("p35-section"))
     ).id;
     const channel = (
-      await createSpace(p, { communityId, kind: "channel", parentSpaceId: section, visibility: "public", description: "c" })
+      await createSpace(p, { communityId, createdByMemberId: admin.memberId, kind: "channel", parentSpaceId: section, visibility: "public", description: "c" }, undefined, corr("p35-channel"))
     ).id;
     const thread = (
-      await createSpace(p, { communityId, kind: "thread", parentSpaceId: channel, visibility: "public", description: "t" })
+      await createSpace(p, { communityId, createdByMemberId: admin.memberId, kind: "thread", parentSpaceId: channel, visibility: "public", description: "t" }, undefined, corr("p35-thread"))
     ).id;
     for (const id of [section, channel, thread]) {
       const res = await evaluateEffectiveAccess(p, { actorMemberId: guest.memberId, targetSpaceId: id });
@@ -391,13 +401,25 @@ test("Pass 35: private project traversal, grant, subtree, and revoke", async () 
 
     // A private descendant resets the boundary: requires its own grant.
     const privateChannel = (
-      await createSpace(p, { communityId, kind: "channel", parentSpaceId: section, visibility: "private", description: "private c" })
+      await createSpace(p, { communityId, createdByMemberId: admin.memberId, kind: "channel", parentSpaceId: section, visibility: "private", description: "private c" }, undefined, corr("p35-private-channel"))
     ).id;
     assert.equal(
       (await evaluateEffectiveAccess(p, { actorMemberId: guest.memberId, targetSpaceId: privateChannel })).accessible,
       false,
       "private descendant requires its own grant",
     );
+
+    // Negative: a public child under an UNGRANTED private ancestor is denied —
+    // public visibility never widens an earlier private boundary.
+    const publicUnderPrivate = (
+      await createSpace(p, { communityId, createdByMemberId: admin.memberId, kind: "thread", parentSpaceId: privateChannel, visibility: "public", description: "pub under priv" }, undefined, corr("p35-pub-under-private"))
+    ).id;
+    assert.equal(
+      (await evaluateEffectiveAccess(p, { actorMemberId: guest.memberId, targetSpaceId: publicUnderPrivate })).accessible,
+      false,
+      "a public child of an ungranted private ancestor must be denied",
+    );
+
     // Grant at the private descendant succeeds.
     await grantSpaceMembership(p, {
       spaceId: privateChannel,
@@ -411,9 +433,6 @@ test("Pass 35: private project traversal, grant, subtree, and revoke", async () 
     );
 
     // A public child of private ancestry is public only within that ancestry.
-    const publicUnderPrivate = (
-      await createSpace(p, { communityId, kind: "thread", parentSpaceId: privateChannel, visibility: "public", description: "pub under priv" })
-    ).id;
     assert.equal(
       (await evaluateEffectiveAccess(p, { actorMemberId: guest.memberId, targetSpaceId: publicUnderPrivate })).accessible,
       true,
@@ -494,13 +513,13 @@ test("space tree: malformed depth, cross-community parent, and bad kind are reje
 
     // thread cannot have children (depth four is the maximum)
     const section = (
-      await createSpace(pool, { communityId, kind: "section", parentSpaceId: projectId, visibility: "public", description: "s" })
+      await createSpace(pool, { communityId, createdByMemberId: admin.memberId, kind: "section", parentSpaceId: projectId, visibility: "public", description: "s" }, undefined, corr("tree-section"))
     ).id;
     const channel = (
-      await createSpace(pool, { communityId, kind: "channel", parentSpaceId: section, visibility: "public", description: "c" })
+      await createSpace(pool, { communityId, createdByMemberId: admin.memberId, kind: "channel", parentSpaceId: section, visibility: "public", description: "c" }, undefined, corr("tree-channel"))
     ).id;
     const thread = (
-      await createSpace(pool, { communityId, kind: "thread", parentSpaceId: channel, visibility: "public", description: "t" })
+      await createSpace(pool, { communityId, createdByMemberId: admin.memberId, kind: "thread", parentSpaceId: channel, visibility: "public", description: "t" }, undefined, corr("tree-thread"))
     ).id;
     await expectReject(
       pool,
@@ -538,6 +557,7 @@ test("admission invite: targeted human and agent accept create members; never a 
       target: { kind: "human", targetCredentialId: guest.rootCredentialId },
       issuerMemberId: admin.memberId,
       expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("dup-admission"),
     });
     await assert.rejects(
       acceptCommunityAdmissionInvite(pool, dup),
@@ -550,6 +570,7 @@ test("admission invite: targeted human and agent accept create members; never a 
       target: { kind: "agent", targetAgentId: guest.agentId },
       issuerMemberId: admin.memberId,
       expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("agent-admission"),
     });
     const accepted = await acceptCommunityAdmissionInvite(pool, agentInvite);
     assert.ok(accepted);
@@ -583,6 +604,7 @@ test("space invite: targets an existing active member, never admits, and is term
       spaceId: projectId,
       issuerMemberId: admin.memberId,
       expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("space-invite"),
     });
 
     // Accepting a space invite grants space access only — it must NOT create a member.
@@ -609,6 +631,7 @@ test("space invite: targets an existing active member, never admits, and is term
         spaceId: projectId,
         issuerMemberId: admin.memberId,
         expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        correlationId: corr("outsider-space-invite"),
       }),
       (error: unknown) =>
         error instanceof Error &&
@@ -646,6 +669,7 @@ test("admission acceptance is a locked, once-only consume: revoked and expired i
       target: { kind: "human", targetCredentialId: outsiderRoot },
       issuerMemberId: admin.memberId,
       expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("revoked-admission"),
     });
     await pool.query(
       `UPDATE community_admission_invite SET state = 'revoked' WHERE id = $1`,
@@ -666,6 +690,7 @@ test("admission acceptance is a locked, once-only consume: revoked and expired i
       target: { kind: "human", targetCredentialId: outsiderRoot },
       issuerMemberId: admin.memberId,
       expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("expired-admission"),
     });
     assert.equal(await acceptCommunityAdmissionInvite(pool, expiredInvite), null);
     assert.equal(
@@ -682,6 +707,7 @@ test("admission acceptance is a locked, once-only consume: revoked and expired i
       target: { kind: "human", targetCredentialId: outsiderRoot },
       issuerMemberId: admin.memberId,
       expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("valid-admission"),
     });
     const accepted = await acceptCommunityAdmissionInvite(pool, valid);
     assert.ok(accepted);
@@ -736,7 +762,7 @@ test("admission and space invite targets and issuers are validated at the DB bou
     // A space invite must target a project root or private descendant: a public
     // section is rejected.
     const publicSection = (
-      await createSpace(pool, { communityId, kind: "section", parentSpaceId: projectId, visibility: "public", description: "s" })
+      await createSpace(pool, { communityId, createdByMemberId: admin.memberId, kind: "section", parentSpaceId: projectId, visibility: "public", description: "s" }, undefined, corr("target-public-section"))
     ).id;
     await expectReject(
       pool,
@@ -748,7 +774,7 @@ test("admission and space invite targets and issuers are validated at the DB bou
     );
     // ... but a private descendant is accepted.
     const privateSection = (
-      await createSpace(pool, { communityId, kind: "section", parentSpaceId: projectId, visibility: "private", description: "ps" })
+      await createSpace(pool, { communityId, createdByMemberId: admin.memberId, kind: "section", parentSpaceId: projectId, visibility: "private", description: "ps" }, undefined, corr("target-private-section"))
     ).id;
     await issueSpaceInvite(pool, {
       communityId,
@@ -756,6 +782,7 @@ test("admission and space invite targets and issuers are validated at the DB bou
       spaceId: privateSection,
       issuerMemberId: admin.memberId,
       expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("target-private-invite"),
     });
 
     // A cross-community issuer is rejected for a space invite.
@@ -915,6 +942,227 @@ test("authorization matrix: every capability is identical for assigned human and
   });
 });
 
+test("invite issue and revoke commands write typed audit; a no-op revoke or failed issue writes none", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    // Issuing an admission invite records its typed issued audit with the issuer.
+    const admissionInvite = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: guest.rootCredentialId },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("issue-admission-audit"),
+    });
+    const issuedAdmission = await pool.query(
+      `SELECT event_type, actor_member_id, correlation_id FROM audit_event WHERE event_type = $1`,
+      ["community.admission.invite.issued"],
+    );
+    assert.equal(issuedAdmission.rows.length, 1);
+    assert.equal(issuedAdmission.rows[0].actor_member_id, admin.memberId);
+    assert.ok(
+      String(issuedAdmission.rows[0].correlation_id).startsWith("m1-2:issue-admission-audit:"),
+      "issued-admission audit must carry the caller correlation id",
+    );
+
+    // Issuing a space invite records its typed issued audit with the issuer.
+    const spaceInvite = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("issue-space-audit"),
+    });
+    const issuedSpace = await pool.query(
+      `SELECT event_type, actor_member_id FROM audit_event WHERE event_type = $1`,
+      ["space.invite.issued"],
+    );
+    assert.equal(issuedSpace.rows.length, 1);
+    assert.equal(issuedSpace.rows[0].actor_member_id, admin.memberId);
+
+    // Revoking each invite records its typed revoked audit with the actor.
+    assert.equal(
+      await revokeCommunityAdmissionInvite(
+        pool, admissionInvite, admin.memberId, "test", corr("revoke-admission"),
+      ),
+      true,
+    );
+    assert.equal(
+      await revokeSpaceInvite(pool, spaceInvite, admin.memberId, "test", corr("revoke-space")),
+      true,
+    );
+    const revoked = await pool.query(
+      `SELECT event_type, actor_member_id, metadata FROM audit_event
+       WHERE event_type IN ($1, $2) ORDER BY event_type`,
+      ["community.admission.invite.revoked", "space.invite.revoked"],
+    );
+    assert.equal(revoked.rows.length, 2);
+    for (const row of revoked.rows) {
+      assert.equal(row.actor_member_id, admin.memberId);
+      assert.equal(row.metadata.reason, "test");
+    }
+
+    // Revoking an already-terminal invite is a no-op: no transition, no audit.
+    const revokeAuditBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type IN ($1, $2)`,
+      ["community.admission.invite.revoked", "space.invite.revoked"],
+    )).rows[0].n;
+    assert.equal(await revokeCommunityAdmissionInvite(
+      pool, admissionInvite, admin.memberId, "again", corr("revoke-again"),
+    ), false);
+    assert.equal(await revokeSpaceInvite(pool, spaceInvite, admin.memberId, "again", corr("revoke-again")), false);
+    const revokeAuditAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type IN ($1, $2)`,
+      ["community.admission.invite.revoked", "space.invite.revoked"],
+    )).rows[0].n;
+    assert.equal(revokeAuditAfter, revokeAuditBefore, "no audit for a no-op revoke");
+
+    // A failed issue (revoked root target, rejected by the DB trigger) rolls
+    // back the insert AND its audit: no issued event may survive.
+    const revokedPerson = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["issuer-bad"])
+    ).rows[0].id;
+    const revokedRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [revokedPerson, "bad-root"],
+      )
+    ).rows[0].id;
+    await pool.query(`UPDATE credential SET revoked_at = now() WHERE id = $1`, [revokedRoot]);
+    const issuedBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["community.admission.invite.issued"],
+    )).rows[0].n;
+    await assert.rejects(
+      issueCommunityAdmissionInvite(pool, {
+        communityId,
+        target: { kind: "human", targetCredentialId: revokedRoot },
+        issuerMemberId: admin.memberId,
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        correlationId: corr("bad-issue"),
+      }),
+      (error: unknown) => error instanceof Error && /active human root credential/.test(error.message),
+    );
+    const issuedAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["community.admission.invite.issued"],
+    )).rows[0].n;
+    assert.equal(issuedAfter, issuedBefore, "a rolled-back issue must write no issued audit");
+  });
+});
+
+test("every createSpace writes a typed space.create audit with the acting creator", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, projectId } = await buildFixture(pool);
+    const auditBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["space.create"],
+    )).rows[0].n;
+
+    // A section (no root grant) must still be audited with the acting creator.
+    const section = (
+      await createSpace(pool, {
+        communityId,
+        createdByMemberId: admin.memberId,
+        kind: "section",
+        parentSpaceId: projectId,
+        visibility: "public",
+        description: "audited section",
+      }, undefined, corr("audit-section"))
+    ).id;
+    const row = await pool.query(
+      `SELECT actor_member_id, correlation_id, community_id,
+              metadata->>'kind' AS kind, metadata->>'visibility' AS visibility
+       FROM audit_event WHERE event_type = $1 AND target_id = $2`,
+      ["space.create", section],
+    );
+    assert.equal(row.rows.length, 1);
+    assert.equal(row.rows[0].actor_member_id, admin.memberId);
+    assert.equal(row.rows[0].community_id, communityId);
+    assert.equal(row.rows[0].kind, "section");
+    assert.equal(row.rows[0].visibility, "public");
+    assert.equal(
+      (await pool.query(`SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`, ["space.create"])).rows[0].n,
+      auditBefore + 1,
+    );
+
+    // A rolled-back space create (bad parent kind) writes no space.create audit.
+    const auditAfterSection = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["space.create"],
+    )).rows[0].n;
+    await assert.rejects(
+      createSpace(pool, {
+        communityId,
+        createdByMemberId: admin.memberId,
+        kind: "channel",
+        parentSpaceId: projectId,
+        visibility: "public",
+      }, undefined, corr("bad-channel")),
+      (error: unknown) => error instanceof Error && /channel must parent only to a section/.test(error.message),
+    );
+    const auditAfterFailed = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["space.create"],
+    )).rows[0].n;
+    assert.equal(auditAfterFailed, auditAfterSection, "no space.create audit for a rolled-back create");
+  });
+});
+
+test("accepting an already-issued space invite fails with no grant/audit when the target member is revoked after issue", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    const invite = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("revoked-target-invite"),
+    });
+
+    // Revoke the target member after the invite was issued.
+    await pool.query(
+      `UPDATE member SET revoked_at = now(), revoked_reason = 'test' WHERE id = $1`,
+      [guest.memberId],
+    );
+
+    const grantBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM space_membership`,
+    )).rows[0].n;
+    const grantAuditBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 OR event_type = $2`,
+      ["space.access.grant", "space.invite.accepted"],
+    )).rows[0].n;
+
+    await assert.rejects(
+      acceptSpaceInvite(pool, invite, corr("revoked-target-accept")),
+      (error: unknown) => error instanceof Error && /requires an active member/.test(error.message),
+    );
+
+    const grantAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM space_membership`,
+    )).rows[0].n;
+    assert.equal(grantAfter, grantBefore, "no grant may be created for a revoked member");
+    const grantAuditAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 OR event_type = $2`,
+      ["space.access.grant", "space.invite.accepted"],
+    )).rows[0].n;
+    assert.equal(grantAuditAfter, grantAuditBefore, "no grant/accepted audit for a rolled-back accept");
+    const state = await pool.query(
+      `SELECT state FROM space_invite WHERE id = $1`,
+      [invite],
+    );
+    assert.equal(state.rows[0].state, "issued", "the invite must remain issued after a failed acceptance");
+  });
+});
+
 test("grant and revoke commands write their own typed audit in the same transaction", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
@@ -980,13 +1228,18 @@ test("createSpace with a root grant is atomic: a failing grant leaves no project
       `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
       ["space.access.grant"],
     )).rows[0].n;
+    const spaceCreateAuditBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["space.create"],
+    )).rows[0].n;
     await assert.rejects(
       createSpace(pool, {
         communityId,
+        createdByMemberId: admin.memberId,
         kind: "project",
         visibility: "private",
         ownerMemberId: admin.memberId,
-      }, { memberId: revokedMember.id, grantedByMemberId: admin.memberId }),
+      }, { memberId: revokedMember.id, grantedByMemberId: admin.memberId }, corr("atomic-project")),
       (error: unknown) =>
         error instanceof Error && /requires an active member/.test(error.message),
     );
@@ -997,5 +1250,10 @@ test("createSpace with a root grant is atomic: a failing grant leaves no project
       ["space.access.grant"],
     )).rows[0].n;
     assert.equal(grantAuditAfter, grantAuditBefore, "no grant audit may be written for a rolled-back grant");
+    const spaceCreateAuditAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["space.create"],
+    )).rows[0].n;
+    assert.equal(spaceCreateAuditAfter, spaceCreateAuditBefore, "no space.create audit may be written for a rolled-back project");
   });
 });
