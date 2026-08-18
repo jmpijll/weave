@@ -260,10 +260,15 @@ export async function revokeSpaceInvite(
 
 /**
  * Accept a community admission invite, creating the identified member in the
- * same transaction. The consume is conditional and row-locked: only an invite
- * still `issued` and unexpired is accepted, and the terminal transition is
- * asserted to affect exactly one row, so a revoked or expired invite can never
- * admit a fresh member.
+ * same transaction. The consume is conditional and row-locked, and the bound
+ * target is revalidated under lock at consume time using the same active-target
+ * predicate as issuance: a flashback trigger (an INSERT/UPDATE-time check) is a
+ * statement about the moment of writing, never the moment of use, so a target
+ * that became revoked (or otherwise inactive) after the invite was issued must
+ * not admit a member. If the target is no longer active, the consume is refused
+ * with the invite left `issued` and no member, transition, or audit write. The
+ * terminal transition is asserted to affect exactly one row, so a revoked,
+ * expired, or concurrently-consumed invite can never admit a fresh member.
  */
 export async function acceptCommunityAdmissionInvite(
   client: DbClient,
@@ -286,16 +291,27 @@ export async function acceptCommunityAdmissionInvite(
     );
     if (invite.rows.length === 0) return null;
     const row = invite.rows[0];
-    const member =
-      row.target_kind === "human"
-        ? await createMember(tx, {
-            communityId: row.community_id,
-            subject: { kind: "human", personId: await credentialPersonId(tx, row.target_credential_id!) },
-          })
-        : await createMember(tx, {
-            communityId: row.community_id,
-            subject: { kind: "agent", agentId: row.target_agent_id! },
-          });
+    let member: { id: string };
+    if (row.target_kind === "human") {
+      // Revalidate and lock the bound human root: it must still be an active
+      // human root (unrevoked, no parent). Never silently retarget the invite to
+      // a different credential of the same person.
+      const personId = await activeHumanRootPersonId(tx, row.target_credential_id!);
+      if (personId === null) return null;
+      member = await createMember(tx, {
+        communityId: row.community_id,
+        subject: { kind: "human", personId },
+      });
+    } else {
+      // Revalidate and lock the bound agent target: the agent must still exist
+      // with its bound credential active under the issuance predicate.
+      const agentId = await activeAgentTargetId(tx, row.target_agent_id!);
+      if (agentId === null) return null;
+      member = await createMember(tx, {
+        communityId: row.community_id,
+        subject: { kind: "agent", agentId },
+      });
+    }
     const transitioned = await transitionInvite(tx, "community_admission_invite", inviteId, "accepted");
     if (transitioned !== 1) {
       throw new Error("admission invite was consumed concurrently");
@@ -367,11 +383,39 @@ export async function acceptSpaceInvite(
   });
 }
 
-async function credentialPersonId(client: DbClient, credentialId: string): Promise<string> {
+/**
+ * Resolve and lock the bound human root of an admission invite at consume time.
+ * Returns null (a refusal that leaves the invite `issued`) when the credential
+ * is gone or no longer an active human root — matching the issuance trigger
+ * predicate `kind = 'human' AND parent_credential_id IS NULL AND revoked_at IS NULL`.
+ */
+async function activeHumanRootPersonId(client: DbClient, credentialId: string): Promise<string | null> {
   const result = await client.query<{ person_id: string }>(
-    "SELECT person_id FROM credential WHERE id = $1",
+    `SELECT person_id
+     FROM credential
+     WHERE id = $1 AND kind = 'human' AND parent_credential_id IS NULL AND revoked_at IS NULL
+     FOR UPDATE`,
     [credentialId],
   );
-  if (result.rows.length === 0) throw new Error("admission invite target credential not found");
+  if (result.rows.length === 0) return null;
   return result.rows[0].person_id;
+}
+
+/**
+ * Resolve and lock the bound agent target of an admission invite at consume
+ * time. Returns null (a refusal that leaves the invite `issued`) when the agent
+ * is gone or its bound credential is no longer active — matching the issuance
+ * trigger predicate (`agent_cred.revoked_at IS NULL`).
+ */
+async function activeAgentTargetId(client: DbClient, agentId: string): Promise<string | null> {
+  const result = await client.query<{ id: string }>(
+    `SELECT a.id
+     FROM agent a
+     JOIN credential c ON c.id = a.credential_id
+     WHERE a.id = $1 AND c.revoked_at IS NULL
+     FOR UPDATE OF c, a`,
+    [agentId],
+  );
+  if (result.rows.length === 0) return null;
+  return result.rows[0].id;
 }

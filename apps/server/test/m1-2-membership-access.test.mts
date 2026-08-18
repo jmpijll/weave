@@ -1207,6 +1207,100 @@ test("accepting an already-issued space invite fails with no grant/audit when th
   });
 });
 
+test("admission acceptance revalidates the target at consume: a human root revoked after issue refuses with no member/audit", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin } = await buildFixture(pool);
+
+    // A person who is not yet a member, with an active root at issue time.
+    const outsider = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["revoked-after-issue-human"])
+    ).rows[0].id;
+    const outsiderRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [outsider, "revoked-after-issue-root"],
+      )
+    ).rows[0].id;
+
+    const invite = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("revoked-after-issue-human-invite"),
+    });
+
+    // Revoke the root AFTER the invite was issued, then accept: must be refused.
+    await pool.query(`UPDATE credential SET revoked_at = now() WHERE id = $1`, [outsiderRoot]);
+
+    const membersBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM member WHERE community_id = $1 AND person_id = $2`,
+      [communityId, outsider],
+    )).rows[0].n;
+
+    assert.equal(await acceptCommunityAdmissionInvite(pool, invite, corr("revoked-after-issue-human-accept")), null);
+
+    const membersAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM member WHERE community_id = $1 AND person_id = $2`,
+      [communityId, outsider],
+    )).rows[0].n;
+    assert.equal(membersAfter, membersBefore, "no member may be created for a human root revoked after issue");
+    const admissionAuditAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 AND metadata->>'inviteId' = $2`,
+      ["member.admission", invite],
+    )).rows[0].n;
+    assert.equal(admissionAuditAfter, 0, "no admission audit may accompany a refused accept");
+    const state = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`,
+      [invite],
+    );
+    assert.equal(state.rows[0].state, "issued", "the invite must remain issued after a refused consume");
+  });
+});
+
+test("admission acceptance revalidates the target at consume: an agent credential revoked after issue refuses with no member/audit", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest } = await buildFixture(pool);
+
+    const invite = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "agent", targetAgentId: guest.agentId },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("revoked-after-issue-agent-invite"),
+    });
+
+    // Revoke the agent's bound credential AFTER the invite was issued.
+    await pool.query(`UPDATE credential SET revoked_at = now() WHERE id = $1`, [guest.agentCredentialId]);
+
+    const agentMembersBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM member WHERE community_id = $1 AND agent_id = $2`,
+      [communityId, guest.agentId],
+    )).rows[0].n;
+
+    assert.equal(await acceptCommunityAdmissionInvite(pool, invite, corr("revoked-after-issue-agent-accept")), null);
+
+    const agentMembersAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM member WHERE community_id = $1 AND agent_id = $2`,
+      [communityId, guest.agentId],
+    )).rows[0].n;
+    assert.equal(agentMembersAfter, agentMembersBefore, "no member may be created for an agent credential revoked after issue");
+    const admissionAuditAfter = (await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 AND metadata->>'inviteId' = $2`,
+      ["member.admission", invite],
+    )).rows[0].n;
+    assert.equal(admissionAuditAfter, 0, "no admission audit may accompany a refused accept");
+    const state = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`,
+      [invite],
+    );
+    assert.equal(state.rows[0].state, "issued", "the invite must remain issued after a refused consume");
+  });
+});
+
 test("expiry commands: past-due issued invites transition to expired exactly once with one system audit; active and terminal rows are no-ops", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
