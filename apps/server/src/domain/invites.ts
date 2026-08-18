@@ -98,23 +98,98 @@ export async function issueSpaceInvite(
  * Transition an invite (admission or space) to a terminal state. Returns the
  * number of rows actually transitioned (0 when the invite is no longer
  * `issued`, e.g. already consumed or terminal). Private: every externally
- * reachable transition must go through an audited command (accept/revoke),
- * never through this raw helper.
+ * reachable transition must go through an audited command (accept/revoke/
+ * expire), never through this raw helper. Expiry is intentionally excluded
+ * here: it is a system/clock transition with its own audited command and must
+ * never be conflated with an actor-initiated revocation.
  */
 async function transitionInvite(
   client: DbClient,
   table: "community_admission_invite" | "space_invite",
   inviteId: string,
-  to: Exclude<InviteState, "issued">,
+  to: Exclude<InviteState, "issued" | "expired">,
+  reason?: string,
 ): Promise<number> {
-  const allowedTo = ["accepted", "revoked", "expired"];
+  const allowedTo = ["accepted", "revoked"];
   if (!allowedTo.includes(to)) throw new Error(`invalid invite target state: ${to}`);
-  const column = to === "accepted" ? "accepted_at" : "revoked_at";
+  if (to === "revoked" && (reason === undefined || reason.trim() === "")) {
+    throw new Error("revoking an invite requires a non-empty reason");
+  }
   const result = await client.query(
-    `UPDATE ${table} SET state = $2, ${column} = now() WHERE id = $1 AND state = 'issued'`,
-    [inviteId, to],
+    `UPDATE ${table}
+     SET state = $2,
+         accepted_at = CASE WHEN $2 = 'accepted' THEN now() ELSE NULL END,
+         revoked_at = CASE WHEN $2 = 'revoked' THEN now() ELSE NULL END,
+         revoked_reason = $3
+     WHERE id = $1 AND state = 'issued'`,
+    [inviteId, to, to === "revoked" ? reason : null],
   );
   return result.rowCount ?? 0;
+}
+
+/**
+ * Expire a community-admission invite whose expiry has passed. This is the
+ * system/clock terminal transition: it transitions exactly one issued row when
+ * `expires_at <= now()`, records a distinct typed expiry audit with no actor
+ * (the clock is the authority, not a human or agent member), and returns false
+ * with no audit for an active (not yet due) or already-terminal row.
+ */
+export async function expireCommunityAdmissionInvite(
+  client: DbClient,
+  inviteId: string,
+  correlationId: string,
+): Promise<boolean> {
+  return inTransaction(client, async (tx) => {
+    const result = await tx.query<{ community_id: string; expires_at: Date }>(
+      `UPDATE community_admission_invite
+       SET state = 'expired'
+       WHERE id = $1 AND state = 'issued' AND expires_at <= now()
+       RETURNING id, community_id, expires_at`,
+      [inviteId],
+    );
+    if (result.rows.length === 0) return false;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.admissionInviteExpired,
+      communityId: result.rows[0].community_id,
+      actorMemberId: null,
+      targetType: "community_admission_invite",
+      targetId: inviteId,
+      metadata: { expiresAt: result.rows[0].expires_at.toISOString() },
+      correlationId,
+    });
+    return true;
+  });
+}
+
+/**
+ * Expire a space invite whose expiry has passed. System/clock terminal
+ * transition with the same contract as `expireCommunityAdmissionInvite`.
+ */
+export async function expireSpaceInvite(
+  client: DbClient,
+  inviteId: string,
+  correlationId: string,
+): Promise<boolean> {
+  return inTransaction(client, async (tx) => {
+    const result = await tx.query<{ community_id: string; expires_at: Date }>(
+      `UPDATE space_invite
+       SET state = 'expired'
+       WHERE id = $1 AND state = 'issued' AND expires_at <= now()
+       RETURNING id, community_id, expires_at`,
+      [inviteId],
+    );
+    if (result.rows.length === 0) return false;
+    await writeAuditEvent(tx, {
+      eventType: AUDIT_EVENT.spaceInviteExpired,
+      communityId: result.rows[0].community_id,
+      actorMemberId: null,
+      targetType: "space_invite",
+      targetId: inviteId,
+      metadata: { expiresAt: result.rows[0].expires_at.toISOString() },
+      correlationId,
+    });
+    return true;
+  });
 }
 
 /**
@@ -135,7 +210,7 @@ export async function revokeCommunityAdmissionInvite(
       [inviteId],
     );
     if (info.rows.length === 0) return false;
-    const transitioned = await transitionInvite(tx, "community_admission_invite", inviteId, "revoked");
+    const transitioned = await transitionInvite(tx, "community_admission_invite", inviteId, "revoked", reason);
     if (transitioned !== 1) return false;
     await writeAuditEvent(tx, {
       eventType: AUDIT_EVENT.admissionInviteRevoked,
@@ -168,7 +243,7 @@ export async function revokeSpaceInvite(
       [inviteId],
     );
     if (info.rows.length === 0) return false;
-    const transitioned = await transitionInvite(tx, "space_invite", inviteId, "revoked");
+    const transitioned = await transitionInvite(tx, "space_invite", inviteId, "revoked", reason);
     if (transitioned !== 1) return false;
     await writeAuditEvent(tx, {
       eventType: AUDIT_EVENT.spaceInviteRevoked,
@@ -264,12 +339,16 @@ export async function acceptSpaceInvite(
     );
     if (invite.rows.length === 0) return null;
     const row = invite.rows[0];
+    // One shared operation correlation ID: the acceptance and its access grant
+    // are a single logical operation, so both audit records must share it even
+    // when the caller omits a correlation ID.
+    const opCorrelationId = correlationId ?? randomUUID();
     await grantSpaceMembership(tx, {
       spaceId: row.space_id,
       memberId: row.target_member_id,
       grantedByMemberId: row.issuer_member_id,
       source: "invite",
-      correlationId: correlationId ?? randomUUID(),
+      correlationId: opCorrelationId,
     });
     const transitioned = await transitionInvite(tx, "space_invite", inviteId, "accepted");
     if (transitioned !== 1) {
@@ -282,7 +361,7 @@ export async function acceptSpaceInvite(
       targetType: "space_invite",
       targetId: inviteId,
       metadata: { spaceId: row.space_id, targetMemberId: row.target_member_id },
-      correlationId: correlationId ?? randomUUID(),
+      correlationId: opCorrelationId,
     });
     return { spaceId: row.space_id };
   });

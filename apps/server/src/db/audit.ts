@@ -13,9 +13,11 @@ export const AUDIT_EVENT = {
   roleRevoked: "role.revoked",
   admissionInviteIssued: "community.admission.invite.issued",
   admissionInviteRevoked: "community.admission.invite.revoked",
+  admissionInviteExpired: "community.admission.invite.expired",
   spaceInviteIssued: "space.invite.issued",
   spaceInviteAccepted: "space.invite.accepted",
   spaceInviteRevoked: "space.invite.revoked",
+  spaceInviteExpired: "space.invite.expired",
 } as const;
 
 export type AuditEventType = (typeof AUDIT_EVENT)[keyof typeof AUDIT_EVENT];

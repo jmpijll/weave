@@ -385,7 +385,15 @@ CREATE TRIGGER space_invite_target_checks
 
 -- ---------------------------------------------------------------------------
 -- Shared invite state machine (admission + space): issued -> accepted/revoked/
--- expired are terminal; an invite cannot be accepted twice or after expiry.
+-- expired are terminal; an invite cannot be accepted twice or after expiry, and
+-- each terminal state carries exactly its own timestamp/reason shape:
+--   * issued   -> no terminal fields (accepted_at/revoked_at/revoked_reason NULL)
+--   * accepted -> only accepted_at (no revocation fields)
+--   * revoked  -> revoked_at plus a non-empty revoked_reason (no accepted_at)
+--   * expired  -> no accepted/revoked/reason fields (the service-layer clock
+--                 check decides whether an issued row is due; the schema keeps
+--                 the shape invariant only, so the now() gate stays in service
+--                 code as the implementation spec assigns)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION enforce_invite_state_machine() RETURNS trigger AS $$
 BEGIN
@@ -400,12 +408,23 @@ BEGIN
       IF NEW.accepted_at > OLD.expires_at THEN
         RAISE EXCEPTION 'invite cannot be accepted after expiry';
       END IF;
+      IF NEW.revoked_at IS NOT NULL OR NEW.revoked_reason IS NOT NULL THEN
+        RAISE EXCEPTION 'accepted invite must not carry revocation fields';
+      END IF;
     ELSIF NEW.state = 'revoked' THEN
       IF NEW.revoked_at IS NULL THEN
         NEW.revoked_at := now();
       END IF;
+      IF NEW.revoked_reason IS NULL OR btrim(NEW.revoked_reason) = '' THEN
+        RAISE EXCEPTION 'revoked invite must carry a non-empty revoke reason';
+      END IF;
+      IF NEW.accepted_at IS NOT NULL THEN
+        RAISE EXCEPTION 'revoked invite must not carry an acceptance timestamp';
+      END IF;
     ELSIF NEW.state = 'expired' THEN
-      NULL;
+      IF NEW.accepted_at IS NOT NULL OR NEW.revoked_at IS NOT NULL OR NEW.revoked_reason IS NOT NULL THEN
+        RAISE EXCEPTION 'expired invite must not carry terminal fields';
+      END IF;
     ELSE
       RAISE EXCEPTION 'invalid target invite state %', NEW.state;
     END IF;
@@ -413,19 +432,22 @@ BEGIN
     IF NEW.state <> 'issued' THEN
       RAISE EXCEPTION 'invite must be created in the issued state';
     END IF;
+    IF NEW.accepted_at IS NOT NULL OR NEW.revoked_at IS NOT NULL OR NEW.revoked_reason IS NOT NULL THEN
+      RAISE EXCEPTION 'issued invite must not carry terminal fields';
+    END IF;
   END IF;
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER community_admission_invite_state_machine
-  BEFORE INSERT OR UPDATE OF state, accepted_at, revoked_at
+  BEFORE INSERT OR UPDATE OF state, accepted_at, revoked_at, revoked_reason
   ON community_admission_invite
   FOR EACH ROW
   EXECUTE FUNCTION enforce_invite_state_machine();
 
 CREATE TRIGGER space_invite_state_machine
-  BEFORE INSERT OR UPDATE OF state, accepted_at, revoked_at
+  BEFORE INSERT OR UPDATE OF state, accepted_at, revoked_at, revoked_reason
   ON space_invite
   FOR EACH ROW
   EXECUTE FUNCTION enforce_invite_state_machine();

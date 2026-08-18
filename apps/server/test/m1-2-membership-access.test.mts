@@ -12,9 +12,11 @@ import {
   issueCommunityAdmissionInvite,
   acceptCommunityAdmissionInvite,
   revokeCommunityAdmissionInvite,
+  expireCommunityAdmissionInvite,
   issueSpaceInvite,
   acceptSpaceInvite,
   revokeSpaceInvite,
+  expireSpaceInvite,
 } from "../src/domain/invites.ts";
 
 const { Client } = pg;
@@ -618,6 +620,26 @@ test("space invite: targets an existing active member, never admits, and is term
       true,
     );
 
+    // A single operation correlation ID is generated once when the caller omits
+    // it, and the access grant and the acceptance share it exactly.
+    const grantAudit = await pool.query(
+      `SELECT correlation_id FROM audit_event
+       WHERE event_type = $1 AND metadata->>'memberId' = $2 AND metadata->>'spaceId' = $3`,
+      ["space.access.grant", guest.memberId, projectId],
+    );
+    const acceptedAudit = await pool.query(
+      `SELECT correlation_id FROM audit_event WHERE event_type = $1 AND target_id = $2`,
+      ["space.invite.accepted", invite],
+    );
+    assert.equal(grantAudit.rows.length, 1);
+    assert.equal(acceptedAudit.rows.length, 1);
+    assert.ok(grantAudit.rows[0].correlation_id, "an omitted correlation ID must be generated");
+    assert.equal(
+      acceptedAudit.rows[0].correlation_id,
+      grantAudit.rows[0].correlation_id,
+      "grant and accepted audits must share one operation correlation ID",
+    );
+
     // A space invite to a non-member is rejected at the DB boundary: an
     // unadmitted person has no member record, so the target lookup (STRICT)
     // fails before any invite row can be created.
@@ -672,7 +694,7 @@ test("admission acceptance is a locked, once-only consume: revoked and expired i
       correlationId: corr("revoked-admission"),
     });
     await pool.query(
-      `UPDATE community_admission_invite SET state = 'revoked' WHERE id = $1`,
+      `UPDATE community_admission_invite SET state = 'revoked', revoked_reason = 'test' WHERE id = $1`,
       [revokedInvite],
     );
     assert.equal(await acceptCommunityAdmissionInvite(pool, revokedInvite), null);
@@ -1004,6 +1026,28 @@ test("invite issue and revoke commands write typed audit; a no-op revoke or fail
       assert.equal(row.metadata.reason, "test");
     }
 
+    // The central terminal transition persists a non-empty reason on the invite
+    // row itself (not only in the audit metadata) for both invite types.
+    const admissionRevokeRow = await pool.query(
+      `SELECT state, accepted_at, revoked_at, revoked_reason
+       FROM community_admission_invite WHERE id = $1`,
+      [admissionInvite],
+    );
+    assert.equal(admissionRevokeRow.rows[0].state, "revoked");
+    assert.equal(admissionRevokeRow.rows[0].accepted_at, null);
+    assert.ok(admissionRevokeRow.rows[0].revoked_at, "revoked admission invite must carry revoked_at");
+    assert.equal(admissionRevokeRow.rows[0].revoked_reason, "test");
+
+    const spaceRevokeRow = await pool.query(
+      `SELECT state, accepted_at, revoked_at, revoked_reason
+       FROM space_invite WHERE id = $1`,
+      [spaceInvite],
+    );
+    assert.equal(spaceRevokeRow.rows[0].state, "revoked");
+    assert.equal(spaceRevokeRow.rows[0].accepted_at, null);
+    assert.ok(spaceRevokeRow.rows[0].revoked_at, "revoked space invite must carry revoked_at");
+    assert.equal(spaceRevokeRow.rows[0].revoked_reason, "test");
+
     // Revoking an already-terminal invite is a no-op: no transition, no audit.
     const revokeAuditBefore = (await pool.query(
       `SELECT count(*)::int AS n FROM audit_event WHERE event_type IN ($1, $2)`,
@@ -1163,6 +1207,497 @@ test("accepting an already-issued space invite fails with no grant/audit when th
   });
 });
 
+test("expiry commands: past-due issued invites transition to expired exactly once with one system audit; active and terminal rows are no-ops", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    // Admission invite that is past due at issue (issued but expires_at <= now).
+    const admissionInvite = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: guest.rootCredentialId },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("expire-admission"),
+    });
+    // Acceptance refuses the past-due row even before it is explicitly expired.
+    assert.equal(await acceptCommunityAdmissionInvite(pool, admissionInvite, corr("accept-expired-admission")), null);
+
+    // Expiring transitions exactly one row and emits exactly one system audit.
+    assert.equal(await expireCommunityAdmissionInvite(pool, admissionInvite, corr("expire-admission-cmd")), true);
+    const admissionState = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`, [admissionInvite],
+    );
+    assert.equal(admissionState.rows[0].state, "expired");
+    const admissionExpired = await pool.query(
+      `SELECT event_type, actor_member_id, correlation_id FROM audit_event WHERE event_type = $1`,
+      ["community.admission.invite.expired"],
+    );
+    assert.equal(admissionExpired.rows.length, 1);
+    assert.equal(admissionExpired.rows[0].actor_member_id, null, "expiry audit has no human/agent actor");
+    assert.ok(
+      String(admissionExpired.rows[0].correlation_id).startsWith("m1-2:expire-admission-cmd:"),
+      "expiry audit must carry the system correlation id",
+    );
+
+    // Acceptance refuses the explicit expiry state too.
+    assert.equal(await acceptCommunityAdmissionInvite(pool, admissionInvite, corr("accept-expired-again")), null);
+
+    // Repeated expiry is a no-op: no state change and no second audit.
+    assert.equal(await expireCommunityAdmissionInvite(pool, admissionInvite, corr("expire-admission-again")), false);
+    assert.equal(
+      (await pool.query(
+        `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+        ["community.admission.invite.expired"],
+      )).rows[0].n,
+      1,
+    );
+
+    // An active (not yet due) invite is a no-op: still issued, no expiry audit.
+    const activeAdmission = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: guest.rootCredentialId },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("active-admission"),
+    });
+    assert.equal(await expireCommunityAdmissionInvite(pool, activeAdmission, corr("expire-active")), false);
+    const activeAdmissionState = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`, [activeAdmission],
+    );
+    assert.equal(activeAdmissionState.rows[0].state, "issued");
+    assert.equal(
+      (await pool.query(
+        `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+        ["community.admission.invite.expired"],
+      )).rows[0].n,
+      1,
+      "an active admission invite must not emit an expiry audit",
+    );
+
+    // Space invite: same contract on its own table and audit type.
+    const spaceInvite = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("expire-space"),
+    });
+    assert.equal(await acceptSpaceInvite(pool, spaceInvite, corr("accept-expired-space")), null);
+    assert.equal(await expireSpaceInvite(pool, spaceInvite, corr("expire-space-cmd")), true);
+    const spaceState = await pool.query(
+      `SELECT state FROM space_invite WHERE id = $1`, [spaceInvite],
+    );
+    assert.equal(spaceState.rows[0].state, "expired");
+    const spaceExpiredCount = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+      ["space.invite.expired"],
+    );
+    const spaceExpiredWithActor = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 AND actor_member_id IS NOT NULL`,
+      ["space.invite.expired"],
+    );
+    assert.equal(spaceExpiredCount.rows[0].n, 1);
+    assert.equal(spaceExpiredWithActor.rows[0].n, 0, "space expiry audit has no human/agent actor");
+    assert.equal(await expireSpaceInvite(pool, spaceInvite, corr("expire-space-again")), false);
+    assert.equal(
+      (await pool.query(
+        `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+        ["space.invite.expired"],
+      )).rows[0].n,
+      1,
+    );
+
+    // An active (not yet due) space invite is also a no-op: still issued, no audit.
+    const activeSpace = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("active-space"),
+    });
+    assert.equal(await expireSpaceInvite(pool, activeSpace, corr("expire-active-space")), false);
+    const activeSpaceState = await pool.query(
+      `SELECT state FROM space_invite WHERE id = $1`, [activeSpace],
+    );
+    assert.equal(activeSpaceState.rows[0].state, "issued", "an active space invite must remain issued");
+    assert.equal(
+      (await pool.query(
+        `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1`,
+        ["space.invite.expired"],
+      )).rows[0].n,
+      1,
+      "an active space invite must not emit an expiry audit",
+    );
+  });
+});
+
+test("expiry racing acceptance: an accept that lands first is the sole terminal result with its own effects", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    // Admission: accept-first ordering — the accepted state is the only terminal
+    // result; the later expiry is a no-op and emits no expiry audit.
+    const outsider = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["race-acc-outsider"])
+    ).rows[0].id;
+    const outsiderRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [outsider, "race-acc-root"],
+      )
+    ).rows[0].id;
+    const accAdmission = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("race-acc-admission"),
+    });
+    const accepted = await acceptCommunityAdmissionInvite(pool, accAdmission, corr("race-acc-admission-accept"));
+    assert.ok(accepted, "accept-first ordering: the accept must win");
+    assert.equal(await expireCommunityAdmissionInvite(pool, accAdmission, corr("race-acc-admission-expire")), false);
+    const admissionFinal = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`, [accAdmission],
+    );
+    assert.equal(admissionFinal.rows[0].state, "accepted", "exactly one terminal state: accepted");
+    const admitted = await pool.query(
+      `SELECT count(*)::int AS n FROM member WHERE community_id = $1 AND person_id = $2`,
+      [communityId, outsider],
+    );
+    assert.equal(admitted.rows[0].n, 1, "accepted ordering admits the member exactly once");
+    const admissionAcceptAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event
+       WHERE event_type = $1 AND metadata->>'inviteId' = $2`,
+      ["member.admission", accAdmission],
+    );
+    assert.equal(admissionAcceptAudit.rows[0].n, 1, "only the admission audit accompanies the accept");
+    const admissionExpireAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event
+       WHERE event_type = $1 AND target_id = $2`,
+      ["community.admission.invite.expired", accAdmission],
+    );
+    assert.equal(admissionExpireAudit.rows[0].n, 0, "no expiry audit may follow a winning accept");
+
+    // Space: accept-first ordering — the acceptance grant is the only effect.
+    const accSpace = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("race-acc-space"),
+    });
+    assert.ok(await acceptSpaceInvite(pool, accSpace, corr("race-acc-space-accept")));
+    assert.equal(await expireSpaceInvite(pool, accSpace, corr("race-acc-space-expire")), false);
+    const spaceFinal = await pool.query(
+      `SELECT state FROM space_invite WHERE id = $1`, [accSpace],
+    );
+    assert.equal(spaceFinal.rows[0].state, "accepted", "exactly one terminal state: accepted");
+    const granted = await pool.query(
+      `SELECT count(*)::int AS n FROM space_membership
+       WHERE space_id = $1 AND member_id = $2 AND revoked_at IS NULL`,
+      [projectId, guest.memberId],
+    );
+    assert.equal(granted.rows[0].n, 1, "accepted ordering grants access exactly once");
+    const spaceAcceptAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 AND target_id = $2`,
+      ["space.invite.accepted", accSpace],
+    );
+    assert.equal(spaceAcceptAudit.rows[0].n, 1, "only the accepted audit accompanies the accept");
+    const spaceExpireAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 AND target_id = $2`,
+      ["space.invite.expired", accSpace],
+    );
+    assert.equal(spaceExpireAudit.rows[0].n, 0, "no expiry audit may follow a winning accept");
+  });
+});
+
+test("expiry racing acceptance: an expiry that lands first is the sole terminal result with no grant/acceptance effects", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    // Admission: expire-first ordering — the expired state is the only terminal
+    // result; the later accept is a no-op that admits nobody.
+    const outsider = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["race-exp-outsider"])
+    ).rows[0].id;
+    const outsiderRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [outsider, "race-exp-root"],
+      )
+    ).rows[0].id;
+    const expAdmission = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("race-exp-admission"),
+    });
+    assert.equal(await expireCommunityAdmissionInvite(pool, expAdmission, corr("race-exp-admission-expire")), true);
+    assert.equal(await acceptCommunityAdmissionInvite(pool, expAdmission, corr("race-exp-admission-accept")), null);
+    const admissionFinal = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`, [expAdmission],
+    );
+    assert.equal(admissionFinal.rows[0].state, "expired", "exactly one terminal state: expired");
+    const admitted = await pool.query(
+      `SELECT count(*)::int AS n FROM member WHERE community_id = $1 AND person_id = $2`,
+      [communityId, outsider],
+    );
+    assert.equal(admitted.rows[0].n, 0, "expired ordering must not admit a member");
+    const admissionExpireAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event
+       WHERE event_type = $1 AND target_id = $2`,
+      ["community.admission.invite.expired", expAdmission],
+    );
+    assert.equal(admissionExpireAudit.rows[0].n, 1, "only the expiry audit accompanies the expire");
+    const admissionAcceptAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event
+       WHERE event_type = $1 AND metadata->>'inviteId' = $2`,
+      ["member.admission", expAdmission],
+    );
+    assert.equal(admissionAcceptAudit.rows[0].n, 0, "no admission audit may follow a winning expire");
+
+    // Space: expire-first ordering — no grant is created.
+    const expSpace = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("race-exp-space"),
+    });
+    assert.equal(await expireSpaceInvite(pool, expSpace, corr("race-exp-space-expire")), true);
+    assert.equal(await acceptSpaceInvite(pool, expSpace, corr("race-exp-space-accept")), null);
+    const spaceFinal = await pool.query(
+      `SELECT state FROM space_invite WHERE id = $1`, [expSpace],
+    );
+    assert.equal(spaceFinal.rows[0].state, "expired", "exactly one terminal state: expired");
+    const granted = await pool.query(
+      `SELECT count(*)::int AS n FROM space_membership
+       WHERE space_id = $1 AND member_id = $2 AND revoked_at IS NULL`,
+      [projectId, guest.memberId],
+    );
+    assert.equal(granted.rows[0].n, 0, "expired ordering must not create a grant");
+    const spaceExpireAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 AND target_id = $2`,
+      ["space.invite.expired", expSpace],
+    );
+    assert.equal(spaceExpireAudit.rows[0].n, 1, "only the expiry audit accompanies the expire");
+    const spaceAcceptAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type = $1 AND target_id = $2`,
+      ["space.invite.accepted", expSpace],
+    );
+    assert.equal(spaceAcceptAudit.rows[0].n, 0, "no accepted audit may follow a winning expire");
+  });
+});
+
+test("expiry racing acceptance: concurrent submit serializes on the row to exactly one terminal result and one effect set", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin } = await buildFixture(pool);
+
+    const outsider = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["race-concurrent-outsider"])
+    ).rows[0].id;
+    const outsiderRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [outsider, "race-concurrent-root"],
+      )
+    ).rows[0].id;
+    const raceInvite = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 5000).toISOString(),
+      correlationId: corr("race-concurrent-invite"),
+    });
+
+    const [accepted, expired] = await Promise.all([
+      acceptCommunityAdmissionInvite(pool, raceInvite, corr("race-concurrent-accept")),
+      expireCommunityAdmissionInvite(pool, raceInvite, corr("race-concurrent-expire")),
+    ]);
+
+    const finalState = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`, [raceInvite],
+    );
+    assert.ok(
+      finalState.rows[0].state === "accepted" || finalState.rows[0].state === "expired",
+      `concurrent race must end in exactly one terminal state, got ${finalState.rows[0].state}`,
+    );
+    assert.ok(
+      (accepted !== null) !== (expired === true),
+      "exactly one of accept/expire may take effect in a concurrent race",
+    );
+    const admitted = await pool.query(
+      `SELECT count(*)::int AS n FROM member WHERE community_id = $1 AND person_id = $2`,
+      [communityId, outsider],
+    );
+    const admissionAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event
+       WHERE event_type = $1 AND metadata->>'inviteId' = $2`,
+      ["member.admission", raceInvite],
+    );
+    const expiryAudit = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event
+       WHERE event_type = $1 AND target_id = $2`,
+      ["community.admission.invite.expired", raceInvite],
+    );
+    if (finalState.rows[0].state === "accepted") {
+      assert.equal(admitted.rows[0].n, 1, "winning accept admits exactly one member");
+      assert.equal(admissionAudit.rows[0].n, 1, "winning accept writes exactly one admission audit");
+      assert.equal(expiryAudit.rows[0].n, 0, "losing expire writes no expiry audit");
+    } else {
+      assert.equal(admitted.rows[0].n, 0, "winning expire admits nobody");
+      assert.equal(admissionAudit.rows[0].n, 0, "losing accept writes no admission audit");
+      assert.equal(expiryAudit.rows[0].n, 1, "winning expire writes exactly one expiry audit");
+    }
+  });
+});
+
+test("expiry atomicity: a failing expiry audit insert rolls the state transition back to issued", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION forbid_expiry_audit() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.event_type IN ('community.admission.invite.expired', 'space.invite.expired') THEN
+          RAISE EXCEPTION 'forced expiry audit failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await pool.query(`
+      CREATE TRIGGER forbid_expiry_audit_trg
+        BEFORE INSERT ON audit_event
+        FOR EACH ROW EXECUTE FUNCTION forbid_expiry_audit()
+    `);
+
+    // Admission: the UPDATE rolls back, the invite stays issued, no audit persists.
+    const admissionInvite = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: guest.rootCredentialId },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("rollback-admission"),
+    });
+    await assert.rejects(
+      expireCommunityAdmissionInvite(pool, admissionInvite, corr("rollback-admission-expire")),
+      (error: unknown) => error instanceof Error && /forced expiry audit failure/.test(error.message),
+    );
+    const admissionState = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`, [admissionInvite],
+    );
+    assert.equal(admissionState.rows[0].state, "issued", "a failed audit must roll the admission expiry back");
+
+    // Space: same atomicity on its own table.
+    const spaceInvite = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("rollback-space"),
+    });
+    await assert.rejects(
+      expireSpaceInvite(pool, spaceInvite, corr("rollback-space-expire")),
+      (error: unknown) => error instanceof Error && /forced expiry audit failure/.test(error.message),
+    );
+    const spaceState = await pool.query(
+      `SELECT state FROM space_invite WHERE id = $1`, [spaceInvite],
+    );
+    assert.equal(spaceState.rows[0].state, "issued", "a failed audit must roll the space expiry back");
+
+    const persistedExpiredAudits = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_event WHERE event_type LIKE '%.invite.expired'`,
+    );
+    assert.equal(persistedExpiredAudits.rows[0].n, 0, "no expiry audit may persist after a rollback");
+  });
+});
+
+test("retry: an expired invitation does not poison a fresh invitation for the same target", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+
+    // Admission: the first invitation expires; a fresh one for the same target
+    // accepts and admits exactly once.
+    const outsider = (
+      await pool.query("INSERT INTO person (display_name) VALUES ($1) RETURNING id", ["retry-outsider"])
+    ).rows[0].id;
+    const outsiderRoot = (
+      await pool.query(
+        `INSERT INTO credential (person_id, public_key, algorithm, kind)
+         VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
+        [outsider, "retry-root"],
+      )
+    ).rows[0].id;
+    const first = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("retry-first-admission"),
+    });
+    assert.equal(await expireCommunityAdmissionInvite(pool, first, corr("retry-first-expire")), true);
+    const second = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: outsiderRoot },
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("retry-second-admission"),
+    });
+    assert.ok(await acceptCommunityAdmissionInvite(pool, second, corr("retry-second-accept")));
+    const admitted = await pool.query(
+      `SELECT count(*)::int AS n FROM member WHERE community_id = $1 AND person_id = $2`,
+      [communityId, outsider],
+    );
+    assert.equal(admitted.rows[0].n, 1, "a fresh invitation after expiry admits the target exactly once");
+    const firstState = await pool.query(`SELECT state FROM community_admission_invite WHERE id = $1`, [first]);
+    assert.equal(firstState.rows[0].state, "expired", "the superseded invitation stays expired");
+    const secondState = await pool.query(`SELECT state FROM community_admission_invite WHERE id = $1`, [second]);
+    assert.equal(secondState.rows[0].state, "accepted", "the fresh invitation takes its own path");
+
+    // Space: a fresh space invite after expiry grants access exactly once.
+    const firstSpace = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+      correlationId: corr("retry-first-space"),
+    });
+    assert.equal(await expireSpaceInvite(pool, firstSpace, corr("retry-first-space-expire")), true);
+    const secondSpace = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      correlationId: corr("retry-second-space"),
+    });
+    assert.ok(await acceptSpaceInvite(pool, secondSpace, corr("retry-second-space-accept")));
+    const granted = await pool.query(
+      `SELECT count(*)::int AS n FROM space_membership
+       WHERE space_id = $1 AND member_id = $2 AND revoked_at IS NULL`,
+      [projectId, guest.memberId],
+    );
+    assert.equal(granted.rows[0].n, 1, "a fresh space invitation after expiry grants access exactly once");
+  });
+});
+
 test("grant and revoke commands write their own typed audit in the same transaction", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
@@ -1255,5 +1790,115 @@ test("createSpace with a root grant is atomic: a failing grant leaves no project
       ["space.create"],
     )).rows[0].n;
     assert.equal(spaceCreateAuditAfter, spaceCreateAuditBefore, "no space.create audit may be written for a rolled-back project");
+  });
+});
+
+test("invite state machine: malformed terminal timestamp/reason shapes are rejected at the DB boundary", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { communityId, admin, guest, projectId } = await buildFixture(pool);
+    const future = new Date(Date.now() + 3600_000).toISOString();
+
+    // An issued row must not carry any terminal field on INSERT.
+    await expectReject(
+      pool,
+      `INSERT INTO community_admission_invite
+         (community_id, target_kind, target_credential_id, issuer_member_id, expires_at, state, accepted_at)
+       VALUES ($1, 'human', $2, $3, $4, 'issued', now())`,
+      [communityId, guest.rootCredentialId, admin.memberId, future],
+      "issued invite must not carry terminal fields",
+    );
+    await expectReject(
+      pool,
+      `INSERT INTO space_invite
+         (community_id, target_member_id, space_id, issuer_member_id, expires_at, state, revoked_reason)
+       VALUES ($1, $2, $3, $4, $5, 'issued', 'x')`,
+      [communityId, guest.memberId, projectId, admin.memberId, future],
+      "issued invite must not carry terminal fields",
+    );
+
+    // An invite may only be created in the issued state.
+    await expectReject(
+      pool,
+      `INSERT INTO community_admission_invite
+         (community_id, target_kind, target_credential_id, issuer_member_id, expires_at, state)
+       VALUES ($1, 'human', $2, $3, $4, 'revoked')`,
+      [communityId, guest.rootCredentialId, admin.memberId, future],
+      "invite must be created in the issued state",
+    );
+
+    // Valid issued rows for the direct-UPDATE shape negatives below.
+    const admission = await issueCommunityAdmissionInvite(pool, {
+      communityId,
+      target: { kind: "human", targetCredentialId: guest.rootCredentialId },
+      issuerMemberId: admin.memberId,
+      expiresAt: future,
+      correlationId: corr("shape-admission"),
+    });
+    const space = await issueSpaceInvite(pool, {
+      communityId,
+      targetMemberId: guest.memberId,
+      spaceId: projectId,
+      issuerMemberId: admin.memberId,
+      expiresAt: future,
+      correlationId: corr("shape-space"),
+    });
+
+    // accepted must not carry revocation fields.
+    await expectReject(
+      pool,
+      `UPDATE community_admission_invite SET state = 'accepted', accepted_at = now(), revoked_reason = 'x' WHERE id = $1`,
+      [admission],
+      "accepted invite must not carry revocation fields",
+    );
+
+    // revoked requires a non-empty reason (null and whitespace both rejected).
+    await expectReject(
+      pool,
+      `UPDATE community_admission_invite SET state = 'revoked', revoked_reason = NULL WHERE id = $1`,
+      [admission],
+      "revoked invite must carry a non-empty revoke reason",
+    );
+    await expectReject(
+      pool,
+      `UPDATE space_invite SET state = 'revoked', revoked_reason = '   ' WHERE id = $1`,
+      [space],
+      "revoked invite must carry a non-empty revoke reason",
+    );
+
+    // revoked must not carry an acceptance timestamp.
+    await expectReject(
+      pool,
+      `UPDATE community_admission_invite SET state = 'revoked', accepted_at = now(), revoked_reason = 'x' WHERE id = $1`,
+      [admission],
+      "revoked invite must not carry an acceptance timestamp",
+    );
+
+    // expired must not carry any terminal field.
+    await expectReject(
+      pool,
+      `UPDATE space_invite SET state = 'expired', revoked_at = now() WHERE id = $1`,
+      [space],
+      "expired invite must not carry terminal fields",
+    );
+    await expectReject(
+      pool,
+      `UPDATE community_admission_invite SET state = 'expired', revoked_reason = 'x' WHERE id = $1`,
+      [admission],
+      "expired invite must not carry terminal fields",
+    );
+
+    // The rows remain issued after every rejected shape.
+    const admissionFinal = await pool.query(
+      `SELECT state FROM community_admission_invite WHERE id = $1`, [admission],
+    );
+    assert.equal(admissionFinal.rows[0].state, "issued");
+    const spaceFinal = await pool.query(
+      `SELECT state, accepted_at, revoked_at, revoked_reason FROM space_invite WHERE id = $1`, [space],
+    );
+    assert.equal(spaceFinal.rows[0].state, "issued");
+    assert.equal(spaceFinal.rows[0].accepted_at, null);
+    assert.equal(spaceFinal.rows[0].revoked_at, null);
+    assert.equal(spaceFinal.rows[0].revoked_reason, null);
   });
 });
