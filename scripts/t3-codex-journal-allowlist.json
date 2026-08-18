@@ -1,0 +1,40 @@
+{
+  "harness": "codex",
+  "codexCli": {
+    "minInclusive": "0.145.0",
+    "maxExclusive": "0.146.0"
+  },
+  "acpAdapter": {
+    "minInclusive": "1.1.7",
+    "maxExclusive": "1.2.0"
+  },
+  "configRoots": {
+    "codexHome": {
+      "path": "<CODEX_HOME>",
+      "allowedPrefixes": [
+        "sessions/",
+        "shell_snapshots/",
+        "logs_*.sqlite",
+        "logs_*.sqlite-shm",
+        "logs_*.sqlite-wal",
+        "state_*.sqlite",
+        "state_*.sqlite-shm",
+        "state_*.sqlite-wal",
+        "goals_*.sqlite",
+        "goals_*.sqlite-shm",
+        "goals_*.sqlite-wal",
+        "queue_*.sqlite",
+        "queue_*.sqlite-shm",
+        "queue_*.sqlite-wal",
+        "memories_*.sqlite",
+        "memories_*.sqlite-shm",
+        "memories_*.sqlite-wal",
+        "cache/",
+        "models_cache.json",
+        "skills/.system/",
+        "tmp/arg0/"
+      ]
+    }
+  },
+  "reason": "Codex app-server sessions and runtime journals, including the root model cache, are allowed only in these measured locations for Codex CLI 0.145.x with ACP adapter 1.1.x. This list is reviewed and checked in; it is never derived from a run."
+}
