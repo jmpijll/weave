@@ -35,6 +35,15 @@
  *                                      no-bump, atomic rollback, zero read
  *                                      mutation, management-authority no-bump
  *                                      (node:test; needs DATABASE_URL)
+ *  13. m3-1-enrollment-schema.test.mts  M3.1 enrollment-schema + protocol-type
+ *                                      groundwork: pairing_token replay-guard
+ *                                      table (6 frozen columns, strict 64-char
+ *                                      lowercase-hex host key, FKs, consume
+ *                                      state) and the four additive host columns
+ *                                      (capabilities JSONB, last_seen_at,
+ *                                      constrained status, paired_at) with
+ *                                      production defaults (node:test; needs
+ *                                      DATABASE_URL)
  *
  * Each layer runs as its own child process with the pinned `node` binary
  * (process.execPath), so a failure is isolated and attributable. A non-zero
@@ -59,6 +68,7 @@ const INVENTORY = [
   { name: "m1-3-2-recovery-verify.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-2-recovery-verify.test.mts"] },
   { name: "m1-3-3-credential-ancestry.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-3-credential-ancestry.test.mts"] },
   { name: "m2-1-epoch-bump.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m2-1-epoch-bump.test.mts"] },
+  { name: "m3-1-enrollment-schema.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-1-enrollment-schema.test.mts"] },
 ];
 
 let failed = 0;

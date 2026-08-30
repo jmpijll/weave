@@ -109,6 +109,12 @@ export interface HostCapabilities {
   harnesses: HarnessCapabilities[];
 }
 
+export type HostStatus = "ready" | "degraded" | "offline";
+
+export interface HostStatusPayload {
+  status: HostStatus;
+}
+
 export interface AgentDefinition {
   id: string;
   ownerPersonId: string;
@@ -248,11 +254,27 @@ export interface ContentReplacePayload {
   bytes: string;
 }
 
+/**
+ * `enroll.host` — the compile-time client → server shape for a host enrollment
+ * request (M3.1; M3.1.3 §2). It is a type shape only. No parsing, verification,
+ * routing, issuance, or consumption is implemented here: the signed-enrollment
+ * transcript and signature scheme are held as M1.3.A-dependent variables and
+ * are selected later, never guessed. The pairing token is replay protection,
+ * not a bearer credential — authority comes from the owner-authorized,
+ * host-public-key-bound request, not possession of the token.
+ */
+export interface EnrollHostPayload {
+  tokenId: string;
+  ownerCredentialId: string;
+  hostPublicKey: string;
+  signature: string;
+}
+
 export type ChallengeMessage = ProtocolEnvelope<"challenge", ChallengePayload>;
 export type ClientAuthenticateMessage = ProtocolEnvelope<"client.authenticate", AuthenticatePayload>;
 export type HostAuthenticateMessage = ProtocolEnvelope<"host.authenticate", AuthenticatePayload>;
 export type HostCapabilitiesMessage = ProtocolEnvelope<"host.capabilities", HostCapabilities>;
-export type HostStatusMessage = ProtocolEnvelope<"host.status", { status: "ready" | "degraded" | "offline" }>;
+export type HostStatusMessage = ProtocolEnvelope<"host.status", HostStatusPayload>;
 export type AgentStartMessage = ProtocolEnvelope<"agent.start", AgentStartPayload>;
 export type AgentStopMessage = ProtocolEnvelope<"agent.stop", { agentId: string }>;
 export type AgentDefinitionMessage = ProtocolEnvelope<"agent.definition", { definition: AgentDefinition }>;
@@ -268,6 +290,7 @@ export type TurnInterruptMessage = ProtocolEnvelope<"turn.interrupt", { sessionI
 export type MessageAckMessage = ProtocolEnvelope<"message.ack", { memberId: string; spaceId: string; messageId: string }>;
 export type ContentFetchMessage = ProtocolEnvelope<"content.fetch", ContentFetchPayload>;
 export type ContentReplaceMessage = ProtocolEnvelope<"content.replace", ContentReplacePayload>;
+export type EnrollHostMessage = ProtocolEnvelope<"enroll.host", EnrollHostPayload>;
 
 export type WireMessage =
   | ChallengeMessage
@@ -289,7 +312,8 @@ export type WireMessage =
   | TurnInterruptMessage
   | MessageAckMessage
   | ContentFetchMessage
-  | ContentReplaceMessage;
+  | ContentReplaceMessage
+  | EnrollHostMessage;
 
 type ParseWireMessage<T> = T extends ProtocolEnvelope<infer TType, infer TPayload>
   ? ParsedProtocolEnvelope<TType, TPayload>
