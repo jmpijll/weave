@@ -12,14 +12,16 @@
 -- anchor (M3 contract §2, architect correction): a token is useful only inside a
 -- valid owner-authorized, host-public-key-bound enrollment request, which is
 -- M3.2 and deliberately not implemented now. `consumed_at` NULL = pending; a
--- consumed (or via expiry) token is inert.
+-- consumed or expired token is inert.
 --
 -- The host columns capture host-level facts that drive the M3 reconnect status
 -- window and capability report. `capabilities` is server-validated JSONB with a
--- safe empty default; `status` is constrained to the frozen ready/degraded/
--- offline set with a safe `offline` default; `paired_at` is non-null with an
--- insertion-time default (auditable enrollment time); `last_seen_at` is nullable
--- because a fresh host has never been seen until its first report.
+-- safe empty default (the frozen `HostCapabilities` form `{"harnesses":[]}`, so
+-- the persisted shape is always valid); `status` is constrained to the frozen
+-- ready/degraded/offline set with a safe `offline` default; `paired_at` is
+-- non-null with an insertion-time default (auditable enrollment time);
+-- `last_seen_at` is nullable because a fresh host has never been seen until its
+-- first report.
 --
 -- No change is made to `credential` or its legacy `public_key` constraints —
 -- M3.1 freezes only the additive pairing-token and host columns.
@@ -30,8 +32,9 @@
 -- ---------------------------------------------------------------------------
 -- pairing_token: single-use, expiring replay-guard record (M3.1 §2)
 -- ---------------------------------------------------------------------------
--- The row is an issue record that the M3.2 consume can null out via
--- `consumed_at`. It is not a credential; enrollment authority comes from the
+-- The row is an issue record that the M3.2 consume completes by setting
+-- `consumed_at`, advancing it from NULL (pending) to a timestamp-consumed row.
+-- It is not a credential; enrollment authority comes from the
 -- owner-authorized, host-public-key-bound request, never from possession of the
 -- token. `host_public_key` is the key the enrollment is bound to; it is frozen
 -- to strict 64-char lowercase hex (matching the M1.3.A lower-hex decision) and
@@ -67,16 +70,17 @@ COMMENT ON COLUMN pairing_token.consumed_at IS
 -- ---------------------------------------------------------------------------
 -- host: additive status / capability persistence (M3.1 §3)
 -- ---------------------------------------------------------------------------
-ALTER TABLE host ADD COLUMN capabilities jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE host ADD COLUMN capabilities jsonb NOT NULL DEFAULT '{"harnesses":[]}'::jsonb;
 ALTER TABLE host ADD COLUMN last_seen_at  timestamptz;
 ALTER TABLE host ADD COLUMN status        text NOT NULL DEFAULT 'offline'
   CHECK (status IN ('ready', 'degraded', 'offline'));
 ALTER TABLE host ADD COLUMN paired_at     timestamptz NOT NULL DEFAULT now();
 
 COMMENT ON COLUMN host.capabilities IS
-  'Server-validated capability descriptor reported by the host; safe empty '
-  'object default. Detected per HarnessDriver.capabilities(); never inspects '
-  'credentials.';
+  'Server-validated capability descriptor reported by the host; a safe empty '
+  'HostCapabilities default ({"harnesses":[]}) so the persisted shape is always '
+  'the frozen HostCapabilities form. Detected per HarnessDriver.capabilities(); '
+  'never inspects credentials.';
 COMMENT ON COLUMN host.last_seen_at IS
   'Nullable last host capability/status report; drives the status window.';
 COMMENT ON COLUMN host.status IS

@@ -269,7 +269,10 @@ test("host carries the four additive columns with production norms and defaults"
 
     assert.equal(map.capabilities.data_type, "jsonb");
     assert.equal(map.capabilities.is_nullable, "NO");
-    assert.ok(map.capabilities.column_default?.includes("{}"), "capabilities defaults to a safe empty object");
+    assert.ok(
+      map.capabilities.column_default?.includes("harnesses"),
+      "capabilities defaults to the frozen HostCapabilities empty form",
+    );
     assert.equal(map.last_seen_at.data_type, "timestamp with time zone");
     assert.equal(map.last_seen_at.is_nullable, "YES");
     assert.equal(map.status.data_type, "text");
@@ -285,7 +288,7 @@ test("host carries the four additive columns with production norms and defaults"
        RETURNING capabilities, status, paired_at, last_seen_at`,
       [person, hostCredential],
     )).rows[0];
-    assert.deepEqual(inserted.capabilities, {}, "capabilities defaults to an empty object");
+    assert.deepEqual(inserted.capabilities, { harnesses: [] }, "capabilities defaults to the empty frozen HostCapabilities form");
     assert.equal(inserted.status, "offline", "status defaults to offline");
     assert.ok(inserted.paired_at, "paired_at is non-null on insert");
     assert.equal(inserted.last_seen_at, null, "last_seen_at is null for a fresh host");

@@ -256,7 +256,7 @@ export interface ContentReplacePayload {
 
 /**
  * `enroll.host` — the compile-time client → server shape for a host enrollment
- * request (M3.1; M3.1.3 §2). It is a type shape only. No parsing, verification,
+ * request (M3.1; M3.1 §2). It is a type shape only. No parsing, verification,
  * routing, issuance, or consumption is implemented here: the signed-enrollment
  * transcript and signature scheme are held as M1.3.A-dependent variables and
  * are selected later, never guessed. The pairing token is replay protection,
