@@ -447,7 +447,7 @@ test("recovery_challenge enforces the canonical TLS-origin representability floo
        VALUES ($1, $2, $3, $4, $5, $6, $7, now() + interval '1 hour')`,
     };
 
-    // Reject an empty origin (POSTGRES_DB canonical origin must be nonempty).
+    // Reject an empty origin (protocol canonical origin must be nonempty).
     await expectReject(
       pool, base.inserts,
       [verifier, person, community, "", nonce, "device-empty", 4],
