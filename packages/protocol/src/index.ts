@@ -1,4 +1,6 @@
 /** The protocol package is the compile-time contract shared by all programs. */
+export * from "./recovery/index.ts";
+
 export const PROTOCOL_NAME = "weave" as const;
 export const PROTOCOL_VERSION = 1 as const;
 

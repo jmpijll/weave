@@ -6,6 +6,7 @@ import type { Pool } from "pg";
 import { createDatabaseConfig, createDatabasePool, databaseUrlFromEnv } from "./db/pool.ts";
 import { runMigrations } from "./db/migrate.ts";
 import { logEvent } from "./log.ts";
+import { handleRecoveryVerify, sendRecoveryV1Unknown } from "./http/recovery-verify.ts";
 
 export const component = {
   name: "server",
@@ -24,6 +25,8 @@ export interface ServerOptions {
   readiness?: ReadinessCheck;
   /** Database pool to drain on shutdown, when one is configured. */
   pool?: Pool;
+  /** M1.3.2 bounded admission control (in-flight limit + raw-body deadline). */
+  admission?: { maxInFlight: number; bodyDeadlineMs: number };
 }
 
 function sendJson(
@@ -37,7 +40,7 @@ function sendJson(
 }
 
 export function createWeaveServer(options: ServerOptions = {}): Server {
-  const { readiness } = options;
+  const { readiness, admission } = options;
   return createServer((request, response) => {
     const url = request.url ?? "";
 
@@ -54,6 +57,18 @@ export function createWeaveServer(options: ServerOptions = {}): Server {
       readiness()
         .then((ok) => sendJson(response, ok ? 200 : 503, { status: ok ? "ready" : "not_ready" }))
         .catch(() => sendJson(response, 503, { status: "not_ready" }));
+      return;
+    }
+
+    // M1.3.2 — the read-only recovery verification endpoint lives under /v1.
+    // Any other /v1 path is the generic S8 not_found; /health, /ready, and the
+    // legacy non-/v1 404 shape are unchanged.
+    if (url.startsWith("/v1/")) {
+      if (url === "/v1/identity/recovery/verify") {
+        void handleRecoveryVerify(request, response, { db: options.pool, ready: readiness, admission });
+        return;
+      }
+      sendRecoveryV1Unknown(response);
       return;
     }
 
