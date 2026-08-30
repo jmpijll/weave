@@ -9,6 +9,12 @@ import type { DbClient } from "./db-client.ts";
  * space access-mode change, or a freshly granted/revoked space) and the guard
  * must re-evaluate.
  *
+ * The epoch is an unbounded PostgreSQL `bigint`. The seam preserves the value
+ * EXACTLY as a JavaScript `bigint`: it casts the column to `text` on the wire
+ * and parses with `BigInt`, never routing it through `Number`. This guarantees
+ * two distinct epoch values above `Number.MAX_SAFE_INTEGER` cannot collapse to
+ * the same JS number and hide a real authorization change from the M2.2 guard.
+ *
  * Every read here is a live, current-committed read — no cache, no memoization
  * — so a revocation is observed by the *next* delivery. Each function returns
  * `null` when the row is absent, never throwing on a missing row. Reads perform
@@ -18,20 +24,24 @@ import type { DbClient } from "./db-client.ts";
  */
 
 export interface CredentialEpoch {
-  epoch: number;
+  epoch: bigint;
 }
 
 export interface MemberEpoch {
-  epoch: number;
+  epoch: bigint;
 }
 
 export interface SpaceEpoch {
-  epoch: number;
+  epoch: bigint;
 }
 
 export interface SpaceMembershipEpoch {
-  epoch: number;
+  epoch: bigint;
   revokedAt: string | null;
+}
+
+function toBigint(value: string): bigint {
+  return BigInt(value);
 }
 
 /** Read the current credential epoch. `null` if no such credential. */
@@ -39,12 +49,12 @@ export async function readCredentialEpoch(
   client: DbClient,
   credentialId: string,
 ): Promise<CredentialEpoch | null> {
-  const result = await client.query<{ epoch: number }>(
-    "SELECT epoch FROM credential WHERE id = $1",
+  const result = await client.query<{ epoch: string }>(
+    "SELECT epoch::text AS epoch FROM credential WHERE id = $1",
     [credentialId],
   );
   if (result.rows.length === 0) return null;
-  return { epoch: Number(result.rows[0].epoch) };
+  return { epoch: toBigint(result.rows[0].epoch) };
 }
 
 /** Read the current member epoch. `null` if no such member. */
@@ -52,12 +62,12 @@ export async function readMemberEpoch(
   client: DbClient,
   memberId: string,
 ): Promise<MemberEpoch | null> {
-  const result = await client.query<{ epoch: number }>(
-    "SELECT epoch FROM member WHERE id = $1",
+  const result = await client.query<{ epoch: string }>(
+    "SELECT epoch::text AS epoch FROM member WHERE id = $1",
     [memberId],
   );
   if (result.rows.length === 0) return null;
-  return { epoch: Number(result.rows[0].epoch) };
+  return { epoch: toBigint(result.rows[0].epoch) };
 }
 
 /** Read the current space epoch. `null` if no such space. */
@@ -65,12 +75,12 @@ export async function readSpaceEpoch(
   client: DbClient,
   spaceId: string,
 ): Promise<SpaceEpoch | null> {
-  const result = await client.query<{ epoch: number }>(
-    "SELECT epoch FROM space WHERE id = $1",
+  const result = await client.query<{ epoch: string }>(
+    "SELECT epoch::text AS epoch FROM space WHERE id = $1",
     [spaceId],
   );
   if (result.rows.length === 0) return null;
-  return { epoch: Number(result.rows[0].epoch) };
+  return { epoch: toBigint(result.rows[0].epoch) };
 }
 
 /** Read the current active space-membership epoch for a (space, member) pair.
@@ -81,11 +91,11 @@ export async function readSpaceMembershipEpoch(
   spaceId: string,
   memberId: string,
 ): Promise<SpaceMembershipEpoch | null> {
-  const result = await client.query<{ epoch: number; revoked_at: string | null }>(
-    `SELECT epoch, revoked_at FROM space_membership
+  const result = await client.query<{ epoch: string; revoked_at: string | null }>(
+    `SELECT epoch::text AS epoch, revoked_at FROM space_membership
      WHERE space_id = $1 AND member_id = $2 AND revoked_at IS NULL`,
     [spaceId, memberId],
   );
   if (result.rows.length === 0) return null;
-  return { epoch: Number(result.rows[0].epoch), revokedAt: result.rows[0].revoked_at };
+  return { epoch: toBigint(result.rows[0].epoch), revokedAt: result.rows[0].revoked_at };
 }

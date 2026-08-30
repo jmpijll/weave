@@ -17,7 +17,10 @@
 -- snapshot, so the grant also bumps the one entity every snapshot contains —
 -- the subject member. The M2.2 guard detects the mismatch and re-evaluates the
 -- full current access set on the next protected delivery (already-frozen
--- stale-snapshot refresh, not a new route).
+-- stale-snapshot refresh, not a new route). A raw membership reassignment
+-- (re-pointing a row's space_id or member_id) moves access between members, so
+-- the trigger bumps every affected member exactly once, not just the one named
+-- in the write.
 --
 -- Scoping: `member_role_assignment` and both invite tables gate management
 -- authority (re-checked per request by hasPermission), not the delivery access
@@ -60,8 +63,9 @@ COMMENT ON COLUMN space.epoch IS
 
 COMMENT ON COLUMN space_membership.epoch IS
   'Monotonic per-(member,space) scope version. DEFAULT 1 on a grant; bumped by '
-  'trigger on that row''s revoked_at transition (R3). Co-located detail; the '
-  'member epoch is the snapshot invalidator.';
+  'trigger on that row''s revoked_at / space_id / member_id real change (R3, '
+  'including raw reassignment and move). Co-located detail; the member epoch is '
+  'the snapshot invalidator.';
 
 -- ---------------------------------------------------------------------------
 -- credential: bump on a real revoked_at transition (R1)
@@ -119,21 +123,40 @@ CREATE TRIGGER space_epoch_bump
   EXECUTE FUNCTION enforce_space_epoch_bump();
 
 -- ---------------------------------------------------------------------------
--- space_membership: bump on grant / real revoked_at transition (R3)
+-- space_membership: bump on grant / real revoked_at, space_id, member_id change
+-- (R3, including raw member reassignment and space move)
 -- ---------------------------------------------------------------------------
 -- The member cross-bump updates only `epoch`, so it does not touch the member
 -- revoked_at column and therefore does not re-fire the member R2 trigger — no
 -- recursion. The member row is the always-present snapshot root, so this makes
--- a freshly granted (or revoked) space visible to the delivery guard.
+-- a freshly granted (or revoked, or reassigned) space visible to the delivery
+-- guard.
+--
+-- `UPDATE OF revoked_at, space_id, member_id` extends the original revoke-only
+-- trigger to raw reassignment: a row re-pointed to a new member moves delivery
+-- access from the old member (who must re-evaluate — their set shrank) to the
+-- new member (who must re-evaluate — their set grew). Per-row epoch advances on
+-- any real change; the member epoch bump covers old AND new member on a member
+-- assignment, and the one member on a space move or revoke. A no-op write
+-- (re-writing an unchanged field) is not a transition and does not bump.
 CREATE OR REPLACE FUNCTION enforce_space_membership_epoch_bump() RETURNS trigger AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
     NEW.epoch := 1;
     UPDATE member SET epoch = epoch + 1 WHERE id = NEW.member_id;
     RETURN NEW;
-  ELSIF TG_OP = 'UPDATE' AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at THEN
-    NEW.epoch := OLD.epoch + 1;
-    UPDATE member SET epoch = epoch + 1 WHERE id = NEW.member_id;
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
+       OR NEW.space_id IS DISTINCT FROM OLD.space_id
+       OR NEW.member_id IS DISTINCT FROM OLD.member_id THEN
+      NEW.epoch := OLD.epoch + 1;
+      IF NEW.member_id IS DISTINCT FROM OLD.member_id THEN
+        UPDATE member SET epoch = epoch + 1 WHERE id = OLD.member_id;
+        UPDATE member SET epoch = epoch + 1 WHERE id = NEW.member_id;
+      ELSE
+        UPDATE member SET epoch = epoch + 1 WHERE id = NEW.member_id;
+      END IF;
+    END IF;
     RETURN NEW;
   END IF;
   RETURN NEW;
@@ -141,7 +164,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER space_membership_epoch_bump
-  BEFORE INSERT OR UPDATE OF revoked_at
+  BEFORE INSERT OR UPDATE OF revoked_at, space_id, member_id
   ON space_membership
   FOR EACH ROW
   EXECUTE FUNCTION enforce_space_membership_epoch_bump();

@@ -196,14 +196,14 @@ test("R1 credential revoke bumps that credential epoch, monotonic, zero mutation
 
     const before0 = (await readCredentialEpoch(pool, admin.deviceCredentialId))!.epoch;
     const beforeRoot = (await readCredentialEpoch(pool, admin.rootCredentialId))!.epoch;
-    assert.equal(before0, 1);
-    assert.equal(beforeRoot, 1);
+    assert.equal(before0, 1n);
+    assert.equal(beforeRoot, 1n);
 
     await pool.query(`UPDATE credential SET revoked_at = now(), revoked_reason = 'compromise' WHERE id = $1`, [
       admin.deviceCredentialId,
     ]);
-    assert.equal((await readCredentialEpoch(pool, admin.deviceCredentialId))!.epoch, 2);
-    assert.equal((await readCredentialEpoch(pool, admin.rootCredentialId))!.epoch, 1);
+    assert.equal((await readCredentialEpoch(pool, admin.deviceCredentialId))!.epoch, 2n);
+    assert.equal((await readCredentialEpoch(pool, admin.rootCredentialId))!.epoch, 1n);
   });
 });
 
@@ -214,12 +214,12 @@ test("R2 member revoke bumps that member epoch", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
     const { guest } = await buildFixture(pool);
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 1);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 1n);
 
     await pool.query(`UPDATE member SET revoked_at = now(), revoked_reason = 'suspension' WHERE id = $1`, [
       guest.memberId,
     ]);
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2n);
   });
 });
 
@@ -232,7 +232,7 @@ test("R3 grant via grantSpaceMembership: member epoch +1, new scope epoch 1, typ
     await runMigrations(pool);
     const { communityId, admin, guest, sectionId } = await buildFixture(pool);
     const memberBefore = (await readMemberEpoch(pool, guest.memberId))!.epoch;
-    assert.equal(memberBefore, 1);
+    assert.equal(memberBefore, 1n);
 
     // The fixture wrote a project-root grant audit; baseline so the new grant's
     // typed audit is a +1 delta, not a global count.
@@ -251,10 +251,10 @@ test("R3 grant via grantSpaceMembership: member epoch +1, new scope epoch 1, typ
     });
 
     // member epoch +1 (the snapshot invalidator signal for a new grant).
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2n);
     // new scope row starts at epoch 1.
     const scope = await readSpaceMembershipEpoch(pool, sectionId, guest.memberId);
-    assert.equal(scope!.epoch, 1);
+    assert.equal(scope!.epoch, 1n);
     assert.equal(scope!.revokedAt, null);
 
     // The command-side audit row is added by the command (command owns audit).
@@ -278,8 +278,8 @@ test("R3 revoke via revokeSpaceMembership: member epoch +1 AND scope epoch +1, t
     });
     const memberAfterGrant = (await readMemberEpoch(pool, guest.memberId))!.epoch;
     const scopeAfterGrant = (await readSpaceMembershipEpoch(pool, sectionId, guest.memberId))!.epoch;
-    assert.equal(memberAfterGrant, 2);
-    assert.equal(scopeAfterGrant, 1);
+    assert.equal(memberAfterGrant, 2n);
+    assert.equal(scopeAfterGrant, 1n);
 
     await revokeSpaceMembership(
       pool,
@@ -290,13 +290,13 @@ test("R3 revoke via revokeSpaceMembership: member epoch +1 AND scope epoch +1, t
       corr("revoke"),
     );
 
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3n);
     // scope row is retained (revoked, not deleted) and its epoch bumps +1.
     const rev = await pool.query<{ epoch: string; revoked_at: string | null }>(
       `SELECT epoch::text AS epoch, revoked_at FROM space_membership WHERE space_id = $1 AND member_id = $2`,
       [sectionId, guest.memberId],
     );
-    assert.equal(Number(rev.rows[0].epoch), 2);
+    assert.equal(BigInt(rev.rows[0].epoch), 2n);
     assert.notEqual(rev.rows[0].revoked_at, null);
 
     const audit = await pool.query(
@@ -313,7 +313,7 @@ test("R3 raw-SQL membership grant and revoke bump member epoch via trigger, no f
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
     const { communityId, admin, guest, sectionId } = await buildFixture(pool);
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 1);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 1n);
 
     // The fixture wrote a project-root grant audit; capture the baseline so a
     // raw grant must NOT add another command-side audit row.
@@ -329,8 +329,8 @@ test("R3 raw-SQL membership grant and revoke bump member epoch via trigger, no f
        VALUES ($1, $2, 'explicit', $3)`,
       [sectionId, guest.memberId, admin.memberId],
     );
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2);
-    assert.equal((await readSpaceMembershipEpoch(pool, sectionId, guest.memberId))!.epoch, 1);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2n);
+    assert.equal((await readSpaceMembershipEpoch(pool, sectionId, guest.memberId))!.epoch, 1n);
     const afterRawGrant = (
       await pool.query<{ n: number }>(
         `SELECT count(*)::int AS n FROM audit_event WHERE event_type = 'space.access.grant'`,
@@ -343,12 +343,12 @@ test("R3 raw-SQL membership grant and revoke bump member epoch via trigger, no f
       `UPDATE space_membership SET revoked_at = now(), revoked_reason = 'x' WHERE space_id = $1 AND member_id = $2`,
       [sectionId, guest.memberId],
     );
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3n);
     const rev = await pool.query<{ epoch: string }>(
       `SELECT epoch::text AS epoch FROM space_membership WHERE space_id = $1 AND member_id = $2`,
       [sectionId, guest.memberId],
     );
-    assert.equal(Number(rev.rows[0].epoch), 2);
+    assert.equal(BigInt(rev.rows[0].epoch), 2n);
     const afterRawRevoke = (
       await pool.query<{ n: number }>(
         `SELECT count(*)::int AS n FROM audit_event WHERE event_type = 'space.access.revoke'`,
@@ -359,16 +359,128 @@ test("R3 raw-SQL membership grant and revoke bump member epoch via trigger, no f
 });
 
 // ---------------------------------------------------------------------------
+// R3 raw reassignment (member reassignment): a row re-pointed to a new member
+// moves delivery access from the old member to the new member. The trigger
+// bumps the row epoch and BOTH affected members exactly once (old loses, new
+// gains), and fabricates no audit.
+// ---------------------------------------------------------------------------
+test("R3 raw member reassignment bumps row epoch and both old and new member epochs, no audit", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { admin, guest, sectionId } = await buildFixture(pool);
+    const guestBefore = (await readMemberEpoch(pool, guest.memberId))!.epoch;
+    const adminBefore = (await readMemberEpoch(pool, admin.memberId))!.epoch;
+    assert.equal(guestBefore, 1n);
+    // Admin already holds the fixture's project-root grant, so its member epoch
+    // is already 2 before any explicit reassignment below.
+    assert.equal(adminBefore, 2n);
+
+    // A grant to guest, then re-point it to admin (a member reassignment).
+    await pool.query(
+      `INSERT INTO space_membership (space_id, member_id, grant_source, granted_by_member_id)
+       VALUES ($1, $2, 'explicit', $3)`,
+      [sectionId, guest.memberId, admin.memberId],
+    );
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2n);
+    assert.equal((await readSpaceMembershipEpoch(pool, sectionId, guest.memberId))!.epoch, 1n);
+
+    const grantAuditBefore = (
+      await pool.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM audit_event WHERE event_type = 'space.access.grant'`,
+      )
+    ).rows[0].n;
+
+    await pool.query(
+      `UPDATE space_membership SET member_id = $1 WHERE space_id = $2 AND member_id = $3`,
+      [admin.memberId, sectionId, guest.memberId],
+    );
+
+    // Old member (guest) loses the grant -> epoch +1.
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3n);
+    // New member (admin) gains the grant -> epoch +1 (2 -> 3).
+    assert.equal((await readMemberEpoch(pool, admin.memberId))!.epoch, 3n);
+    // The reassigned row's epoch advanced, now under admin.
+    const moved = await pool.query<{ epoch: string }>(
+      `SELECT epoch::text AS epoch FROM space_membership WHERE space_id = $1 AND member_id = $2`,
+      [sectionId, admin.memberId],
+    );
+    assert.equal(BigInt(moved.rows[0].epoch), 2n);
+    // The old (guest, section) row no longer exists — it was re-pointed, not copied.
+    const oldRow = await pool.query(
+      `SELECT 1 AS one FROM space_membership WHERE space_id = $1 AND member_id = $2`,
+      [sectionId, guest.memberId],
+    );
+    assert.equal(oldRow.rows.length, 0, "reassignment moves the row, it does not copy it");
+
+    const grantAuditAfter = (
+      await pool.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM audit_event WHERE event_type = 'space.access.grant'`,
+      )
+    ).rows[0].n;
+    assert.equal(grantAuditAfter, grantAuditBefore, "raw reassignment must not fabricate an audit row");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R3 raw space move (space reassignment): a row re-pointed to a different space
+// changes the access set for the single member. The trigger bumps the row epoch
+// and that member epoch, and no-op rewrites bump nothing.
+// ---------------------------------------------------------------------------
+test("R3 raw space move bumps row epoch and the member epoch; no-op rewrite does not bump", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { guest, projectId, sectionId } = await buildFixture(pool);
+
+    await pool.query(
+      `INSERT INTO space_membership (space_id, member_id, grant_source, granted_by_member_id)
+       VALUES ($1, $2, 'explicit', $3)`,
+      [sectionId, guest.memberId, guest.memberId],
+    );
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2n);
+    assert.equal((await readSpaceMembershipEpoch(pool, sectionId, guest.memberId))!.epoch, 1n);
+
+    // Move the grant to the project space (same member, different space).
+    await pool.query(
+      `UPDATE space_membership SET space_id = $1 WHERE space_id = $2 AND member_id = $3`,
+      [projectId, sectionId, guest.memberId],
+    );
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3n);
+    const moved = await pool.query<{ epoch: string }>(
+      `SELECT epoch::text AS epoch FROM space_membership WHERE space_id = $1 AND member_id = $2`,
+      [projectId, guest.memberId],
+    );
+    assert.equal(BigInt(moved.rows[0].epoch), 2n);
+    const oldRow = await pool.query(
+      `SELECT 1 AS one FROM space_membership WHERE space_id = $1 AND member_id = $2`,
+      [sectionId, guest.memberId],
+    );
+    assert.equal(oldRow.rows.length, 0, "move re-points the row, it does not copy it");
+
+    // No-op rewrite of an unchanged field must NOT bump (not a real transition).
+    const beforeNoop = (await readMemberEpoch(pool, guest.memberId))!.epoch;
+    await pool.query(
+      `UPDATE space_membership SET space_id = $1 WHERE space_id = $1 AND member_id = $2`,
+      [projectId, guest.memberId],
+    );
+    assert.equal(
+      (await readMemberEpoch(pool, guest.memberId))!.epoch,
+      beforeNoop,
+      "identical-state membership write must not bump",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // R4: space visibility / archived_at change bumps space.epoch.
 // ---------------------------------------------------------------------------
 test("R4 space visibility change bumps that space epoch", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
     const { projectId } = await buildFixture(pool);
-    assert.equal((await readSpaceEpoch(pool, projectId))!.epoch, 1);
+    assert.equal((await readSpaceEpoch(pool, projectId))!.epoch, 1n);
 
     await pool.query(`UPDATE space SET visibility = 'public' WHERE id = $1`, [projectId]);
-    assert.equal((await readSpaceEpoch(pool, projectId))!.epoch, 2);
+    assert.equal((await readSpaceEpoch(pool, projectId))!.epoch, 2n);
   });
 });
 
@@ -376,10 +488,10 @@ test("R4 space archive (archived_at) change bumps that space epoch", async () =>
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
     const { projectId } = await buildFixture(pool);
-    assert.equal((await readSpaceEpoch(pool, projectId))!.epoch, 1);
+    assert.equal((await readSpaceEpoch(pool, projectId))!.epoch, 1n);
 
     await pool.query(`UPDATE space SET archived_at = now() WHERE id = $1`, [projectId]);
-    assert.equal((await readSpaceEpoch(pool, projectId))!.epoch, 2);
+    assert.equal((await readSpaceEpoch(pool, projectId))!.epoch, 2n);
   });
 });
 
@@ -393,16 +505,16 @@ test("R5 ancestor revoke bumps only the resolved row; read-time chain suppressio
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
     const { admin } = await buildFixture(pool);
-    assert.equal((await readCredentialEpoch(pool, admin.rootCredentialId))!.epoch, 1);
-    assert.equal((await readCredentialEpoch(pool, admin.deviceCredentialId))!.epoch, 1);
+    assert.equal((await readCredentialEpoch(pool, admin.rootCredentialId))!.epoch, 1n);
+    assert.equal((await readCredentialEpoch(pool, admin.deviceCredentialId))!.epoch, 1n);
 
     await pool.query(`UPDATE credential SET revoked_at = now(), revoked_reason = 'compromise' WHERE id = $1`, [
       admin.rootCredentialId,
     ]);
-    assert.equal((await readCredentialEpoch(pool, admin.rootCredentialId))!.epoch, 2);
+    assert.equal((await readCredentialEpoch(pool, admin.rootCredentialId))!.epoch, 2n);
     assert.equal(
       (await readCredentialEpoch(pool, admin.deviceCredentialId))!.epoch,
-      1,
+      1n,
       "descendant credential epoch is not bumped; the M1.3.3 read walk is what suppresses it",
     );
   });
@@ -416,11 +528,11 @@ test("a no-op revoked_at write does not bump; epochs never decrement", async () 
     await runMigrations(pool);
     const { guest } = await buildFixture(pool);
     const start = (await readMemberEpoch(pool, guest.memberId))!.epoch;
-    assert.equal(start, 1);
+    assert.equal(start, 1n);
 
     // Revoke once -> bump.
     await pool.query(`UPDATE member SET revoked_at = now() WHERE id = $1`, [guest.memberId]);
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2n);
 
     // A true no-op (re-writing the exact same revoked_at value) must NOT bump:
     // the IS DISTINCT FROM predicate must observe no transition.
@@ -432,13 +544,13 @@ test("a no-op revoked_at write does not bump; epochs never decrement", async () 
     await pool.query(`UPDATE member SET revoked_at = $1::timestamptz WHERE id = $2`, [sameTs, guest.memberId]);
     assert.equal(
       (await readMemberEpoch(pool, guest.memberId))!.epoch,
-      2,
+      2n,
       "identical-state write must not bump",
     );
 
     // A different (new) timestamp is a real transition and bumps once more.
     await pool.query(`UPDATE member SET revoked_at = now() WHERE id = $1`, [guest.memberId]);
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3n);
   });
 });
 
@@ -446,11 +558,11 @@ test("an unrevoke (revoked_at -> NULL) is a real transition and bumps", async ()
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
     const { guest } = await buildFixture(pool);
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 1);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 1n);
     await pool.query(`UPDATE member SET revoked_at = now(), revoked_reason = 'x' WHERE id = $1`, [guest.memberId]);
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2);
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 2n);
     await pool.query(`UPDATE member SET revoked_at = NULL, revoked_reason = NULL WHERE id = $1`, [guest.memberId]);
-    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3, "unrevoke is a real transition");
+    assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, 3n, "unrevoke is a real transition");
   });
 });
 
@@ -481,6 +593,40 @@ test("a rolled-back grant leaves member and scope epochs unchanged (atomic)", as
     assert.equal((await readMemberEpoch(pool, guest.memberId))!.epoch, memberBefore);
     const scopeAfter = (await readSpaceMembershipEpoch(pool, sectionId, guest.memberId))?.epoch ?? null;
     assert.equal(scopeAfter, scopeBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Read-seam exactness: epoch is a bigint, not a JS number, so two adjacent
+// values beyond Number.MAX_SAFE_INTEGER must remain distinct. A Number() path
+// would collapse both to the same number and hide a real authorization change
+// from the M2.2 guard.
+// ---------------------------------------------------------------------------
+test("read seam preserves adjacent epoch values above Number.MAX_SAFE_INTEGER as distinct bigints", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { guest } = await buildFixture(pool);
+
+    const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+    assert.equal(maxSafe, 9007199254740991n);
+    const hi = maxSafe + 1n; // 9007199254740992n — beyond the safe range
+    const hi2 = maxSafe + 2n; // 9007199254740993n
+
+    // Write two adjacent unsafe values directly; both are distinct.
+    await pool.query(`UPDATE member SET epoch = $1 WHERE id = $2`, [hi.toString(), guest.memberId]);
+    const a = (await readMemberEpoch(pool, guest.memberId))!.epoch;
+    assert.equal(a, hi, "first unsafe epoch value read back exactly");
+
+    await pool.query(`UPDATE member SET epoch = $1 WHERE id = $2`, [hi2.toString(), guest.memberId]);
+    const b = (await readMemberEpoch(pool, guest.memberId))!.epoch;
+    assert.equal(b, hi2, "second unsafe epoch value read back exactly");
+
+    // They must compare distinct at the seam (the failure a Number() path causes).
+    assert.notEqual(a, b, "adjacent unsafe epoch values must not collapse to one number");
+
+    // Demonstrate the Number() collapse this design avoids: both would round to
+    // the same JS number, so a number-based seam could not tell them apart.
+    assert.equal(Number(hi), Number(hi2), "a Number() seam would collapse adjacent unsafe values");
   });
 });
 
