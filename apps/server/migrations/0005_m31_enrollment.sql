@@ -4,7 +4,8 @@
 -- and the four additive `host` columns (capabilities/last_seen_at/status/
 -- paired_at) that the host enrollment and capability-report contract specifies
 -- but that no migration creates today. These are pure schema persistence: the
--- `enroll.host` wire type is a compile-time protocol shape only (M3.1 scope),
+-- future HTTP enrollment request payload is a purpose-specific compile-time
+-- protocol shape only (M3.1 scope),
 -- and no runtime handshake, enrollment ceremony, consume, or audit write is
 -- introduced here.
 --
@@ -26,8 +27,9 @@
 -- No change is made to `credential` or its legacy `public_key` constraints —
 -- M3.1 freezes only the additive pairing-token and host columns.
 --
--- Additive/append-only; no down migration. No protocol/package/runtime/route/
--- transport change beyond the compile-time `enroll.host` protocol type shape.
+-- Additive/append-only; no down migration. No runtime/route/transport change
+-- beyond the purpose-specific compile-time protocol shape for a future HTTP
+-- enrollment request.
 
 -- ---------------------------------------------------------------------------
 -- pairing_token: single-use, expiring replay-guard record (M3.1 §2)
