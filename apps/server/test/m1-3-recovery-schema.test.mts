@@ -466,7 +466,7 @@ test("recovery_challenge enforces the canonical TLS-origin representability floo
       "recovery_challenge_canonical_tls_origin_check",
     );
     // Reject a multibyte (non-ASCII) UTF-8 origin whose UTF-8 byte length exceeds 255.
-    const longUnicode = `wss://${"é".repeat(130)}.example`; // each é = 2 UTF-8 bytes -> >255 bytes
+    const longUnicode = `wss://a${"é".repeat(129)}.example`; // valid host start + é (2 bytes each) -> >255 bytes
     assert.ok(Buffer.byteLength(longUnicode, "utf8") > 255, "fixture must exceed 255 UTF-8 bytes");
     await expectReject(
       pool, base.inserts,
@@ -497,10 +497,27 @@ test("recovery_challenge enforces the canonical TLS-origin representability floo
       [verifier, person, community, "wss:// host", nonce, "device-space", 4],
       "recovery_challenge_canonical_tls_origin_check",
     );
+    // Reject an authority starting with a port separator (never a valid host).
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "wss://:443", nonce, "device-colon-start", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
+    // Reject an authority starting with a hyphen (hostname labels never lead with one).
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "wss://-host", nonce, "device-hyphen-start", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
     // Accept the existing valid origin.
     await pool.query(
       base.inserts,
       [verifier, person, community, "wss://recovery.example:8443", nonce, "device-valid", 4],
+    );
+    // Accept a valid IPv6-literal origin so the floor does not exclude IPv6.
+    await pool.query(
+      base.inserts,
+      [verifier, person, community, "wss://[2001:db8::1]:443", nonce, "device-ipv6", 4],
     );
     // Accept a well-formed origin whose UTF-8 byte length is exactly 255 (the S9
     // upper bound). Host uses valid multi-label DNS: 63+63+63+57-char labels
