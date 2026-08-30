@@ -99,3 +99,57 @@ export async function readSpaceMembershipEpoch(
   if (result.rows.length === 0) return null;
   return { epoch: toBigint(result.rows[0].epoch), revokedAt: result.rows[0].revoked_at };
 }
+
+export type EpochBatchRequest =
+  | { kind: "credential"; id: string }
+  | { kind: "member"; id: string }
+  | { kind: "space"; id: string }
+  | { kind: "spaceMembership"; spaceId: string; memberId: string };
+
+export type EpochBatchResult = {
+  request: EpochBatchRequest;
+  epoch: bigint | null;
+  revokedAt?: string | null;
+};
+
+/** Typed, uncached, one-round-trip batched epoch reader. Preserves input order
+ * and null-for-absent; duplicates produce distinct ordered outputs. No writes.
+ * Executes exactly one SQL statement regardless of batch size. */
+export async function readEpochBatch(
+  client: DbClient,
+  requests: EpochBatchRequest[],
+): Promise<EpochBatchResult[]> {
+  if (requests.length === 0) return [];
+  // Build one fixed parameterized statement: each request is one UNION ALL leg
+  // with its ordinal for ORDER BY, joining to the typed source via lateral.
+  const legs: string[] = [];
+  const params: unknown[] = [];
+  let p = 1;
+  for (let i = 0; i < requests.length; i++) {
+    const req = requests[i];
+    if (req.kind === "credential") {
+      legs.push(`SELECT ${i}::int AS ord, c.epoch::text AS epoch, NULL::timestamptz AS revoked_at FROM (SELECT $${p}::uuid AS id) q LEFT JOIN credential c ON c.id = q.id`);
+      params.push(req.id); p++;
+    } else if (req.kind === "member") {
+      legs.push(`SELECT ${i}::int AS ord, m.epoch::text AS epoch, NULL::timestamptz AS revoked_at FROM (SELECT $${p}::uuid AS id) q LEFT JOIN member m ON m.id = q.id`);
+      params.push(req.id); p++;
+    } else if (req.kind === "space") {
+      legs.push(`SELECT ${i}::int AS ord, s.epoch::text AS epoch, NULL::timestamptz AS revoked_at FROM (SELECT $${p}::uuid AS id) q LEFT JOIN space s ON s.id = q.id`);
+      params.push(req.id); p++;
+    } else {
+      legs.push(`SELECT ${i}::int AS ord, sm.epoch::text AS epoch, sm.revoked_at FROM (SELECT $${p}::uuid AS sid, $${p+1}::uuid AS mid) q LEFT JOIN space_membership sm ON sm.space_id = q.sid AND sm.member_id = q.mid AND sm.revoked_at IS NULL`);
+      params.push(req.spaceId, req.memberId); p+=2;
+    }
+  }
+  const sql = legs.join(" UNION ALL ") + " ORDER BY ord";
+  const result = await client.query<{ ord: number; epoch: string | null; revoked_at: string | null }>(sql, params);
+  // result rows are in ord order
+  return result.rows.map((row, idx) => {
+    const req = requests[row.ord];
+    // idx should equal ord; use ord for mapping to survive any ordering guarantee
+    if (req.kind === "spaceMembership") {
+      return { request: req, epoch: row.epoch !== null ? toBigint(row.epoch) : null, revokedAt: row.revoked_at ?? null };
+    }
+    return { request: req, epoch: row.epoch !== null ? toBigint(row.epoch) : null };
+  });
+}
