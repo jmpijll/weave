@@ -94,7 +94,7 @@ async function seedScope(pool: pg.Pool) {
 test("fresh database applies 0005 once; re-run applies nothing", async () => {
   await withFreshDatabase(async (pool) => {
     const first = await runMigrations(pool);
-    assert.deepEqual(first.applied, [1, 2, 3, 4, 5]);
+    assert.deepEqual(first.applied, [1, 2, 3, 4, 5, 6]);
     assert.equal(first.skipped, 0);
 
     const tables = await pool.query(
@@ -128,7 +128,7 @@ test("fresh database applies 0005 once; re-run applies nothing", async () => {
 
     const second = await runMigrations(pool);
     assert.deepEqual(second.applied, []);
-    assert.equal(second.skipped, 5);
+    assert.equal(second.skipped, 6);
   });
 });
 

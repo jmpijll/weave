@@ -69,6 +69,7 @@ const INVENTORY = [
   { name: "m1-3-3-credential-ancestry.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-3-credential-ancestry.test.mts"] },
   { name: "m2-1-epoch-bump.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m2-1-epoch-bump.test.mts"] },
   { name: "m3-1-enrollment-schema.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-1-enrollment-schema.test.mts"] },
+  { name: "m2-2a-covering-set.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m2-2a-covering-set.test.mts"] },
 ];
 
 let failed = 0;

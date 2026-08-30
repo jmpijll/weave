@@ -99,3 +99,40 @@ export async function readSpaceMembershipEpoch(
   if (result.rows.length === 0) return null;
   return { epoch: toBigint(result.rows[0].epoch), revokedAt: result.rows[0].revoked_at };
 }
+
+export type EpochBatchRequest =
+  | { kind: "credential"; id: string }
+  | { kind: "member"; id: string }
+  | { kind: "space"; id: string }
+  | { kind: "spaceMembership"; spaceId: string; memberId: string };
+
+export type EpochBatchResult = {
+  request: EpochBatchRequest;
+  epoch: bigint | null;
+  revokedAt?: string | null;
+};
+
+/** Typed, uncached, one-round-trip batched epoch reader. Preserves input order
+ * and null-for-absent; duplicates produce distinct ordered outputs. No writes. */
+export async function readEpochBatch(
+  client: DbClient,
+  requests: EpochBatchRequest[],
+): Promise<EpochBatchResult[]> {
+  const results: EpochBatchResult[] = [];
+  for (const req of requests) {
+    if (req.kind === "credential") {
+      const r = await readCredentialEpoch(client, req.id);
+      results.push({ request: req, epoch: r ? r.epoch : null });
+    } else if (req.kind === "member") {
+      const r = await readMemberEpoch(client, req.id);
+      results.push({ request: req, epoch: r ? r.epoch : null });
+    } else if (req.kind === "space") {
+      const r = await readSpaceEpoch(client, req.id);
+      results.push({ request: req, epoch: r ? r.epoch : null });
+    } else {
+      const r = await readSpaceMembershipEpoch(client, req.spaceId, req.memberId);
+      results.push({ request: req, epoch: r ? r.epoch : null, revokedAt: r ? r.revokedAt : null });
+    }
+  }
+  return results;
+}

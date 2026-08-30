@@ -697,14 +697,12 @@ test("role assignment and admission invite do not bump any delivery epoch (manag
 });
 
 // ---------------------------------------------------------------------------
-// Migration hygiene: the forward-only set is 0001-0005 (M3.1 added 0005 after
-// the M2.1 0004 at this base), greatest version 5, no re-application.
-// ---------------------------------------------------------------------------
-test("migration set is forward-only with versions 1..5 applied and greatest version 5", async () => {
+// Migration hygiene: the forward-only set is 0001-0006 (M2.2a added 0006), greatest version 6.
+test("migration set is forward-only with versions 1..6 applied and greatest version 6", async () => {
   await withFreshDatabase(async (pool) => {
     const result = await runMigrations(pool);
-    assert.deepEqual(result.applied, [1, 2, 3, 4, 5], "the M3.1 migration extends the set to version 5");
+    assert.deepEqual(result.applied, [1, 2, 3, 4, 5, 6], "the M3.1 migration extends the set to version 6");
     const ledger = await pool.query("SELECT max(version)::int AS m FROM public.schema_migration");
-    assert.equal(ledger.rows[0].m, 5);
+    assert.equal(ledger.rows[0].m, 6);
   });
 });

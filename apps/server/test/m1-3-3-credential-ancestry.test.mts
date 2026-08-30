@@ -217,6 +217,7 @@ async function expectDeny(
 async function disableCredentialTriggers(pool: pg.Pool): Promise<void> {
   await pool.query(`ALTER TABLE credential DISABLE TRIGGER credential_tree_shape`);
   await pool.query(`ALTER TABLE credential DISABLE TRIGGER credential_dependents`);
+  await pool.query(`ALTER TABLE credential DISABLE TRIGGER credential_immutable_structure`);
 }
 
 // ---------------------------------------------------------------------------
