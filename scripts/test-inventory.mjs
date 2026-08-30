@@ -29,6 +29,12 @@
  *                                      revocation, cycle/over-depth/cross-person/
  *                                      malformed negatives, zero read mutation
  *                                      (node:test; needs DATABASE_URL)
+ *  12. m2-1-epoch-bump.test.mts        M2.1 database-enforced delivery epochs:
+ *                                      R1/R2/R3/R4/R5 bump coverage, member-
+ *                                      epoch grant/revoke invalidation, no-op
+ *                                      no-bump, atomic rollback, zero read
+ *                                      mutation, management-authority no-bump
+ *                                      (node:test; needs DATABASE_URL)
  *
  * Each layer runs as its own child process with the pinned `node` binary
  * (process.execPath), so a failure is isolated and attributable. A non-zero
@@ -52,6 +58,7 @@ const INVENTORY = [
   { name: "m1-3-recovery-schema.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-recovery-schema.test.mts"] },
   { name: "m1-3-2-recovery-verify.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-2-recovery-verify.test.mts"] },
   { name: "m1-3-3-credential-ancestry.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-3-credential-ancestry.test.mts"] },
+  { name: "m2-1-epoch-bump.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m2-1-epoch-bump.test.mts"] },
 ];
 
 let failed = 0;
