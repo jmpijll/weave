@@ -23,6 +23,12 @@
  *  10. m1-3-2-recovery-verify.test.mts  M1.3.2 read-only POST /v1/identity/recovery/verify
  *                                      app-boundary negative + conformance suite
  *                                      (node:test; needs DATABASE_URL)
+ *  11. m1-3-3-credential-ancestry.test.mts M1.3.3 read-time credential ancestry
+ *                                      resolver (S7): valid human-device/agent
+ *                                      resolution, denied on root/host/target
+ *                                      revocation, cycle/over-depth/cross-person/
+ *                                      malformed negatives, zero read mutation
+ *                                      (node:test; needs DATABASE_URL)
  *
  * Each layer runs as its own child process with the pinned `node` binary
  * (process.execPath), so a failure is isolated and attributable. A non-zero
@@ -45,6 +51,7 @@ const INVENTORY = [
   { name: "m1-2-membership-access.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-2-membership-access.test.mts"] },
   { name: "m1-3-recovery-schema.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-recovery-schema.test.mts"] },
   { name: "m1-3-2-recovery-verify.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-2-recovery-verify.test.mts"] },
+  { name: "m1-3-3-credential-ancestry.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-3-credential-ancestry.test.mts"] },
 ];
 
 let failed = 0;
