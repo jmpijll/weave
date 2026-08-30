@@ -430,6 +430,57 @@ test("recovery_challenge carries and refuses invalid protocol, scheme, algorithm
   });
 });
 
+test("recovery_challenge enforces the canonical TLS-origin representability floor", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { community, person } = await seedScope(pool);
+    const verifier = (await pool.query(
+      `INSERT INTO recovery_verifier (person_id, community_id, public_key, environment_code)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [person, community, "verifier-pub", 4],
+    )).rows[0].id;
+    const nonce = Buffer.alloc(32, 5);
+    const base = {
+      inserts: `INSERT INTO recovery_challenge
+         (verifier_id, person_id, community_id, canonical_tls_origin, nonce,
+          intended_device_public_key, environment_code, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, now() + interval '1 hour')`,
+    };
+
+    // Reject an empty origin (POSTGRES_DB canonical origin must be nonempty).
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "", nonce, "device-empty", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
+    // Reject a non-wss:// origin (scheme floor).
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "https://recovery.example:8443", nonce, "device-http", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
+    // Reject a bare wss:// with no host (length === 6, the scheme prefix only).
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "wss://", nonce, "device-bare", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
+    // Reject a multibyte (non-ASCII) UTF-8 origin whose UTF-8 byte length exceeds 255.
+    const longUnicode = `wss://${"é".repeat(130)}.example`; // each é = 2 UTF-8 bytes -> >255 bytes
+    assert.ok(Buffer.byteLength(longUnicode, "utf8") > 255, "fixture must exceed 255 UTF-8 bytes");
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, longUnicode, nonce, "device-long", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
+    // Accept the existing valid origin.
+    await pool.query(
+      base.inserts,
+      [verifier, person, community, "wss://recovery.example:8443", nonce, "device-valid", 4],
+    );
+  });
+});
+
 test("recovery_challenge stores a fixed-size 32-byte nonce and public keys as text", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
