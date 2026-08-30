@@ -273,14 +273,25 @@ test("recovery_challenge is bound to the (verifier, person, community) tuple", a
   });
 });
 
-test("recovery schema enforces the fixed v1 version/algorithm values and permitted environment codes", async () => {
+test("recovery verifier carries and constrains all five v1 protocol/algorithm/environment fields", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
     const { community, person } = await seedScope(pool);
 
-    // Verifier: non-1 version/algorithm values must reject. Establish a valid
-    // verifier per case first (the version CHECK fires before the composite
-    // binding and requires a single fixed environment_code per scope).
+    // The verifier must expose all five persisted metadata columns.
+    const verifierCols = (await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'recovery_verifier'
+         AND column_name IN ('protocol_version','scheme_version','algorithm','algorithm_code','environment_code')
+       ORDER BY column_name`,
+    )).rows;
+    const vcols = verifierCols.map((r) => r.column_name);
+    for (const expected of ["protocol_version", "scheme_version", "algorithm", "algorithm_code", "environment_code"]) {
+      assert.ok(vcols.includes(expected), `recovery_verifier must carry ${expected}`);
+    }
+
+    // Establish one valid verifier per rejection (the version CHECK fires
+    // before the composite binding and each scope needs a fixed environment).
     await pool.query(
       `INSERT INTO recovery_verifier (person_id, community_id, public_key, environment_code)
        VALUES ($1, $2, $3, $4)`,
@@ -297,6 +308,22 @@ test("recovery schema enforces the fixed v1 version/algorithm values and permitt
     await expectReject(
       pool,
       `INSERT INTO recovery_verifier
+         (person_id, community_id, public_key, environment_code, scheme_version)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [person, community, "verifier-pub-scheme", 4, 2],
+      "recovery_verifier_scheme_version_check",
+    );
+    await expectReject(
+      pool,
+      `INSERT INTO recovery_verifier
+         (person_id, community_id, public_key, environment_code, algorithm)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [person, community, "verifier-pub-algtext", 4, "ecdsa"],
+      "recovery_verifier_algorithm_check",
+    );
+    await expectReject(
+      pool,
+      `INSERT INTO recovery_verifier
          (person_id, community_id, public_key, environment_code, algorithm_code)
        VALUES ($1, $2, $3, $4, $5)`,
       [person, community, "verifier-pub-alg", 4, 2],
@@ -309,6 +336,96 @@ test("recovery schema enforces the fixed v1 version/algorithm values and permitt
        VALUES ($1, $2, $3, $4)`,
       [person, community, "verifier-pub-env", 5],
       "recovery_verifier_environment_code_check",
+    );
+  });
+});
+
+test("recovery_challenge carries and refuses invalid protocol, scheme, algorithm code, and environment", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { community, person } = await seedScope(pool);
+    const verifier = (await pool.query(
+      `INSERT INTO recovery_verifier (person_id, community_id, public_key, environment_code)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [person, community, "verifier-pub", 4],
+    )).rows[0].id;
+
+    // The challenge must expose all five persisted metadata columns.
+    const challengeCols = (await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'recovery_challenge'
+         AND column_name IN ('protocol_version','scheme_version','algorithm','algorithm_code','environment_code')
+       ORDER BY column_name`,
+    )).rows;
+    const ccols = challengeCols.map((r) => r.column_name);
+    for (const expected of ["protocol_version", "scheme_version", "algorithm", "algorithm_code", "environment_code"]) {
+      assert.ok(ccols.includes(expected), `recovery_challenge must carry ${expected}`);
+    }
+
+    const base = {
+      nonce: Buffer.alloc(32, 7),
+      origin: "wss://recovery.example:8443",
+      expires: "now() + interval '1 hour'",
+    };
+
+    // Invalid protocol_version rejects on the challenge boundary.
+    await expectReject(
+      pool,
+      `INSERT INTO recovery_challenge
+         (verifier_id, person_id, community_id, canonical_tls_origin, nonce,
+          intended_device_public_key, environment_code, protocol_version, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ${base.expires})`,
+      [verifier, person, community, base.origin, base.nonce, "device-proto", 4, 2],
+      "recovery_challenge_protocol_version_check",
+    );
+    // Invalid scheme_version rejects on the challenge boundary.
+    await expectReject(
+      pool,
+      `INSERT INTO recovery_challenge
+         (verifier_id, person_id, community_id, canonical_tls_origin, nonce,
+          intended_device_public_key, environment_code, scheme_version, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ${base.expires})`,
+      [verifier, person, community, base.origin, base.nonce, "device-scheme", 4, 2],
+      "recovery_challenge_scheme_version_check",
+    );
+    // Invalid algorithm text rejects on the challenge boundary.
+    await expectReject(
+      pool,
+      `INSERT INTO recovery_challenge
+         (verifier_id, person_id, community_id, canonical_tls_origin, nonce,
+          intended_device_public_key, environment_code, algorithm, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ${base.expires})`,
+      [verifier, person, community, base.origin, base.nonce, "device-algtext", 4, "ecdsa"],
+      "recovery_challenge_algorithm_check",
+    );
+    // Invalid algorithm_code rejects on the challenge boundary.
+    await expectReject(
+      pool,
+      `INSERT INTO recovery_challenge
+         (verifier_id, person_id, community_id, canonical_tls_origin, nonce,
+          intended_device_public_key, environment_code, algorithm_code, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ${base.expires})`,
+      [verifier, person, community, base.origin, base.nonce, "device-alg", 4, 2],
+      "recovery_challenge_algorithm_code_check",
+    );
+    // Invalid environment_code rejects on the challenge boundary.
+    await expectReject(
+      pool,
+      `INSERT INTO recovery_challenge
+         (verifier_id, person_id, community_id, canonical_tls_origin, nonce,
+          intended_device_public_key, environment_code, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, ${base.expires})`,
+      [verifier, person, community, base.origin, base.nonce, "device-env", 5],
+      "recovery_challenge_environment_code_check",
+    );
+
+    // A fully valid challenge still inserts (proves the refusals are precise).
+    await pool.query(
+      `INSERT INTO recovery_challenge
+         (verifier_id, person_id, community_id, canonical_tls_origin, nonce,
+          intended_device_public_key, environment_code, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, ${base.expires})`,
+      [verifier, person, community, base.origin, base.nonce, "device-ok", 4],
     );
   });
 });
