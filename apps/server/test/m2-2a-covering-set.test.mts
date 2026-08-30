@@ -249,13 +249,13 @@ test("member no-op does not bump; widened fields bump (isolated revoked_at/commu
     const mtdef = (await pool.query(`SELECT pg_get_triggerdef(oid) AS d FROM pg_trigger WHERE tgname='member_epoch_bump'`)).rows[0].d;
     for (const c of ["person_id","agent_id","subject_kind"]) assert.match(mtdef, new RegExp(c), `member trigger UPDATE OF missing ${c}`);
     // one valid combined re-point still bumps (exercises the covered path end-to-end)
-    const before = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
-    // create a fresh member to re-point without colliding with already-mutated s.member community
     const p3 = (await pool.query(`INSERT INTO person (display_name) VALUES ('p3m') RETURNING id`)).rows[0].id;
     const m3 = (await pool.query(`INSERT INTO member (community_id, subject_kind, person_id) VALUES ($1,'human',$2) RETURNING id`, [s.community, p3])).rows[0].id;
+    const beforeM3 = BigInt((await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [m3])).rows[0].e);
     await pool.query(`UPDATE member SET subject_kind='agent', person_id=NULL, agent_id=$1 WHERE id=$2`, [s.agent, m3]);
-    const after = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [m3])).rows[0].e;
-    assert.notEqual(before, after);
+    const afterM3 = BigInt((await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [m3])).rows[0].e);
+    assert.ok(afterM3 > beforeM3);
+    assert.equal(afterM3, beforeM3 + 1n);
   });
 });
 
