@@ -255,13 +255,13 @@ export interface ContentReplacePayload {
 }
 
 /**
- * `enroll.host` — the compile-time client → server shape for a host enrollment
- * request (M3.1; M3.1 §2). It is a type shape only. No parsing, verification,
- * routing, issuance, or consumption is implemented here: the signed-enrollment
- * transcript and signature scheme are held as M1.3.A-dependent variables and
- * are selected later, never guessed. The pairing token is replay protection,
- * not a bearer credential — authority comes from the owner-authorized,
- * host-public-key-bound request, not possession of the token.
+ * `EnrollHostPayload` — purpose-specific HTTP-only shape for a future
+ * `POST /v1/hosts/enroll`-class host enrollment request (M3.1 §2). Erasable
+ * compile-time type only: no `ProtocolEnvelope`, no `WireMessage` membership,
+ * no parsing/verification/routing/issuance/consumption. The signed-enrollment
+ * transcript and signature scheme are M1.3.A-dependent and selected later.
+ * The pairing token is replay protection, not a bearer credential — authority
+ * comes from the owner-authorized, host-public-key-bound request.
  */
 export interface EnrollHostPayload {
   tokenId: string;
@@ -290,8 +290,6 @@ export type TurnInterruptMessage = ProtocolEnvelope<"turn.interrupt", { sessionI
 export type MessageAckMessage = ProtocolEnvelope<"message.ack", { memberId: string; spaceId: string; messageId: string }>;
 export type ContentFetchMessage = ProtocolEnvelope<"content.fetch", ContentFetchPayload>;
 export type ContentReplaceMessage = ProtocolEnvelope<"content.replace", ContentReplacePayload>;
-export type EnrollHostMessage = ProtocolEnvelope<"enroll.host", EnrollHostPayload>;
-
 export type WireMessage =
   | ChallengeMessage
   | ClientAuthenticateMessage
@@ -312,8 +310,7 @@ export type WireMessage =
   | TurnInterruptMessage
   | MessageAckMessage
   | ContentFetchMessage
-  | ContentReplaceMessage
-  | EnrollHostMessage;
+  | ContentReplaceMessage;
 
 type ParseWireMessage<T> = T extends ProtocolEnvelope<infer TType, infer TPayload>
   ? ParsedProtocolEnvelope<TType, TPayload>

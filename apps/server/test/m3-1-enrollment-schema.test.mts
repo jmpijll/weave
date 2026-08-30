@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import pg from "pg";
 import { randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { MigrationError, runMigrations } from "../src/db/migrate.ts";
 import { createDatabaseConfig, createDatabasePool } from "../src/db/pool.ts";
 
@@ -357,4 +360,12 @@ test("host.capabilities is server-validated JSONB: any JSON object and null-refu
       "null value",
     );
   });
+});
+
+test("EnrollHostPayload is HTTP-only: not a WireMessage member", async () => {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+  const source = await readFile(join(root, "packages/protocol/src/index.ts"), "utf8");
+  assert.ok(source.includes("export interface EnrollHostPayload"), "EnrollHostPayload must remain exported");
+  assert.equal(source.includes("EnrollHostMessage"), false, "EnrollHostMessage must not exist (HTTP-only, not WireMessage)");
+  assert.equal(source.includes('"enroll.host"'), false, '"enroll.host" must not appear as a WireMessage type');
 });
