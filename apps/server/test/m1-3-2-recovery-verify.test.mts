@@ -1304,14 +1304,6 @@ test("two test-only operations share one server boundary while another server st
       async (base) => {
         const first = fetch(`${base}/v1/__test/first`);
         await firstAdmitted;
-        const saturated = await fetch(`${base}/v1/__test/second`);
-        assert.equal(saturated.status, 503, "second operation must share the first operation's limit");
-        assert.equal(saturated.headers.get("retry-after"), "1");
-        const unknown = await fetch(`${base}/v1/unknown-path-with-secret?query=secret`);
-        assert.equal(unknown.status, 404, "generic unknown /v1 must not consume an admission slot");
-        releaseFirst?.();
-        assert.equal((await first).status, 200);
-        assert.equal((await fetch(`${base}/v1/__test/second`)).status, 200);
 
         const isolated = createWeaveServer({
           pool,
@@ -1323,11 +1315,25 @@ test("two test-only operations share one server boundary while another server st
         await new Promise<void>((resolve) => isolated.listen(0, "127.0.0.1", resolve));
         const address = isolated.address();
         const port = typeof address === "object" && address !== null ? address.port : 0;
+        let firstResponse: Response | undefined;
         try {
-          assert.equal((await fetch(`http://127.0.0.1:${port}/v1/__test/second`)).status, 200);
+          assert.equal(
+            (await fetch(`http://127.0.0.1:${port}/v1/__test/second`)).status,
+            200,
+            "a distinct server must admit while the first server remains saturated",
+          );
+          const saturated = await fetch(`${base}/v1/__test/second`);
+          assert.equal(saturated.status, 503, "second operation must share the first operation's limit");
+          assert.equal(saturated.headers.get("retry-after"), "1");
+          const unknown = await fetch(`${base}/v1/unknown-path-with-secret?query=secret`);
+          assert.equal(unknown.status, 404, "generic unknown /v1 must not consume an admission slot");
         } finally {
+          releaseFirst?.();
+          firstResponse = await first;
           await new Promise<void>((resolve, reject) => isolated.close((error) => (error ? reject(error) : resolve())));
         }
+        assert.equal(firstResponse?.status, 200);
+        assert.equal((await fetch(`${base}/v1/__test/second`)).status, 200);
       },
       { maxInFlight: 1, bodyDeadlineMs: 1_000 },
       undefined,
