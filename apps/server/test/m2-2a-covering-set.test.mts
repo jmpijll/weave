@@ -224,13 +224,14 @@ test("credential parent_credential_id refusal and revoked_at still bumps", async
   });
 });
 
-test("member no-op does not bump; each widened field bumps", async () => {
+test("member no-op does not bump; widened fields bump (isolated revoked_at/community_id plus trigger coverage for coupled fields)", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool); const s = await seed(pool);
     const cur = (await pool.query(`SELECT epoch::text AS e, revoked_at, person_id, subject_kind FROM member WHERE id=$1`, [s.member])).rows[0];
     await pool.query(`UPDATE member SET subject_kind=$1 WHERE id=$2`, [cur.subject_kind, s.member]);
     const afterNoop = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
     assert.equal(cur.e, afterNoop);
+    // directly isolated bumps (single-column mutations valid without shape conflict)
     for (const [sql, params] of [
       [`UPDATE member SET revoked_at=now() WHERE id=$1`, [s.member]],
       [`UPDATE member SET community_id=$1 WHERE id=$2`, [s.community2, s.member]],
@@ -240,6 +241,21 @@ test("member no-op does not bump; each widened field bumps", async () => {
       const a = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
       assert.notEqual(b, a, sql);
     }
+    // person_id / agent_id / subject_kind are structurally coupled (subject_kind determines which FK is valid)
+    // so a one-column transition would violate the shape check before reaching epoch logic; instead
+    // prove coverage via trigger UPDATE OF and function body — ensures any real structural re-point is epoch-covered.
+    const mfunc = (await pool.query(`SELECT pg_get_functiondef(oid) AS d FROM pg_proc WHERE proname='enforce_member_epoch_bump'`)).rows[0].d;
+    for (const c of ["person_id","agent_id","subject_kind"]) assert.match(mfunc, new RegExp(c), `member function missing ${c}`);
+    const mtdef = (await pool.query(`SELECT pg_get_triggerdef(oid) AS d FROM pg_trigger WHERE tgname='member_epoch_bump'`)).rows[0].d;
+    for (const c of ["person_id","agent_id","subject_kind"]) assert.match(mtdef, new RegExp(c), `member trigger UPDATE OF missing ${c}`);
+    // one valid combined re-point still bumps (exercises the covered path end-to-end)
+    const before = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
+    // create a fresh member to re-point without colliding with already-mutated s.member community
+    const p3 = (await pool.query(`INSERT INTO person (display_name) VALUES ('p3m') RETURNING id`)).rows[0].id;
+    const m3 = (await pool.query(`INSERT INTO member (community_id, subject_kind, person_id) VALUES ($1,'human',$2) RETURNING id`, [s.community, p3])).rows[0].id;
+    await pool.query(`UPDATE member SET subject_kind='agent', person_id=NULL, agent_id=$1 WHERE id=$2`, [s.agent, m3]);
+    const after = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [m3])).rows[0].e;
+    assert.notEqual(before, after);
   });
 });
 
@@ -328,24 +344,41 @@ test("read-set invariant: only credential.revoked_at is mutable resolver field w
     const triggers = (await pool.query(`SELECT tgname FROM pg_trigger WHERE tgrelid='credential'::regclass AND NOT tgisinternal`)).rows.map(r=>r.tgname);
     assert.ok(triggers.includes("credential_immutable_structure"));
     assert.ok(triggers.includes("credential_dependents"));
-    // host, agent immutable bindings exist
     const allTriggers = (await pool.query(`SELECT tgname FROM pg_trigger WHERE NOT tgisinternal`)).rows.map(r=>r.tgname);
     assert.ok(allTriggers.includes("host_immutable_binding"));
     assert.ok(allTriggers.includes("agent_immutable_binding"));
     assert.ok(allTriggers.includes("prevent_space_membership_delete"));
-    // member and space have epoch bumps for ALL mutable resolver inputs
+    // host/agent: assert both trigger UPDATE OF and function bodies cover required columns
+    for (const [funcName, cols] of [["enforce_host_immutable_binding", ["credential_id","owner_person_id"]], ["enforce_agent_immutable_binding", ["host_id","credential_id"]]] as const) {
+      const fdef = (await pool.query(`SELECT pg_get_functiondef(oid) AS d FROM pg_proc WHERE proname=$1`, [funcName])).rows[0].d;
+      for (const c of cols) assert.match(fdef, new RegExp(c), `${funcName} missing ${c}`);
+    }
+    for (const [tgName, cols] of [["host_immutable_binding", ["credential_id","owner_person_id"]], ["agent_immutable_binding", ["host_id","credential_id"]]] as const) {
+      const tdef = (await pool.query(`SELECT pg_get_triggerdef(oid) AS d FROM pg_trigger WHERE tgname=$1`, [tgName])).rows[0].d;
+      for (const c of cols) assert.match(tdef, new RegExp(c), `${tgName} UPDATE OF missing ${c}`);
+    }
+    // member and space have epoch bumps for ALL mutable resolver inputs — check both trigger UPDATE OF and function
     const mfunc = (await pool.query(`SELECT pg_get_functiondef(oid) AS d FROM pg_proc WHERE proname='enforce_member_epoch_bump'`)).rows[0].d;
-    for (const c of ["revoked_at","person_id","agent_id","subject_kind","community_id"]) assert.match(mfunc, new RegExp(c), `member missing ${c}`);
+    for (const c of ["revoked_at","person_id","agent_id","subject_kind","community_id"]) assert.match(mfunc, new RegExp(c), `member function missing ${c}`);
+    const mtdef = (await pool.query(`SELECT pg_get_triggerdef(oid) AS d FROM pg_trigger WHERE tgname='member_epoch_bump'`)).rows[0].d;
+    for (const c of ["revoked_at","person_id","agent_id","subject_kind","community_id"]) assert.match(mtdef, new RegExp(c), `member trigger UPDATE OF missing ${c}`);
     const sfunc = (await pool.query(`SELECT pg_get_functiondef(oid) AS d FROM pg_proc WHERE proname='enforce_space_epoch_bump'`)).rows[0].d;
-    for (const c of ["visibility","archived_at","parent_space_id","kind","community_id"]) assert.match(sfunc, new RegExp(c), `space missing ${c}`);
-    // credential revoked_at is the sole mutable field not in immutable trigger; negative control
+    for (const c of ["visibility","archived_at","parent_space_id","kind","community_id"]) assert.match(sfunc, new RegExp(c), `space function missing ${c}`);
+    const stdef = (await pool.query(`SELECT pg_get_triggerdef(oid) AS d FROM pg_trigger WHERE tgname='space_epoch_bump'`)).rows[0].d;
+    for (const c of ["visibility","archived_at","parent_space_id","kind","community_id"]) assert.match(stdef, new RegExp(c), `space trigger UPDATE OF missing ${c}`);
+    // credential revoked_at is the sole mutable field not in immutable trigger
     const cfunc = (await pool.query(`SELECT pg_get_functiondef(oid) AS d FROM pg_proc WHERE proname='enforce_credential_immutable_structure'`)).rows[0].d;
     assert.ok(!cfunc.includes("revoked_at"), "revoked_at must not be immutable");
     for (const c of ["person_id","kind","parent_credential_id"]) assert.match(cfunc, new RegExp(c));
-    // negative control: deliberately incomplete expected set must fail
-    const incomplete = ["revoked_at","person_id"];
-    const missing = ["agent_id","subject_kind","community_id"].filter(c => !incomplete.includes(c));
-    assert.ok(missing.length > 0, "negative control: incomplete set is indeed incomplete");
+    // negative control derived from actual asserted manifest: removing one required column must be detectable
+    const requiredHostCols = ["credential_id","owner_person_id"];
+    const requiredAgentCols = ["host_id","credential_id"];
+    const hostFdef = (await pool.query(`SELECT pg_get_functiondef(oid) AS d FROM pg_proc WHERE proname='enforce_host_immutable_binding'`)).rows[0].d;
+    const agentFdef = (await pool.query(`SELECT pg_get_functiondef(oid) AS d FROM pg_proc WHERE proname='enforce_agent_immutable_binding'`)).rows[0].d;
+    const incompleteHost = requiredHostCols.slice(0, 1);
+    assert.ok(incompleteHost.length < requiredHostCols.length && requiredHostCols.some(c => !incompleteHost.includes(c) && hostFdef.includes(c)), "negative control: host manifest would miss a required column if truncated");
+    const incompleteAgent = requiredAgentCols.slice(0, 1);
+    assert.ok(incompleteAgent.length < requiredAgentCols.length && requiredAgentCols.some(c => !incompleteAgent.includes(c) && agentFdef.includes(c)), "negative control: agent manifest would miss a required column if truncated");
   });
 });
 
