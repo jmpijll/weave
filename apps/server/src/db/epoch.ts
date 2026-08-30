@@ -113,26 +113,43 @@ export type EpochBatchResult = {
 };
 
 /** Typed, uncached, one-round-trip batched epoch reader. Preserves input order
- * and null-for-absent; duplicates produce distinct ordered outputs. No writes. */
+ * and null-for-absent; duplicates produce distinct ordered outputs. No writes.
+ * Executes exactly one SQL statement regardless of batch size. */
 export async function readEpochBatch(
   client: DbClient,
   requests: EpochBatchRequest[],
 ): Promise<EpochBatchResult[]> {
-  const results: EpochBatchResult[] = [];
-  for (const req of requests) {
+  if (requests.length === 0) return [];
+  // Build one fixed parameterized statement: each request is one UNION ALL leg
+  // with its ordinal for ORDER BY, joining to the typed source via lateral.
+  const legs: string[] = [];
+  const params: unknown[] = [];
+  let p = 1;
+  for (let i = 0; i < requests.length; i++) {
+    const req = requests[i];
     if (req.kind === "credential") {
-      const r = await readCredentialEpoch(client, req.id);
-      results.push({ request: req, epoch: r ? r.epoch : null });
+      legs.push(`SELECT ${i}::int AS ord, c.epoch::text AS epoch, NULL::timestamptz AS revoked_at FROM (SELECT $${p}::uuid AS id) q LEFT JOIN credential c ON c.id = q.id`);
+      params.push(req.id); p++;
     } else if (req.kind === "member") {
-      const r = await readMemberEpoch(client, req.id);
-      results.push({ request: req, epoch: r ? r.epoch : null });
+      legs.push(`SELECT ${i}::int AS ord, m.epoch::text AS epoch, NULL::timestamptz AS revoked_at FROM (SELECT $${p}::uuid AS id) q LEFT JOIN member m ON m.id = q.id`);
+      params.push(req.id); p++;
     } else if (req.kind === "space") {
-      const r = await readSpaceEpoch(client, req.id);
-      results.push({ request: req, epoch: r ? r.epoch : null });
+      legs.push(`SELECT ${i}::int AS ord, s.epoch::text AS epoch, NULL::timestamptz AS revoked_at FROM (SELECT $${p}::uuid AS id) q LEFT JOIN space s ON s.id = q.id`);
+      params.push(req.id); p++;
     } else {
-      const r = await readSpaceMembershipEpoch(client, req.spaceId, req.memberId);
-      results.push({ request: req, epoch: r ? r.epoch : null, revokedAt: r ? r.revokedAt : null });
+      legs.push(`SELECT ${i}::int AS ord, sm.epoch::text AS epoch, sm.revoked_at FROM (SELECT $${p}::uuid AS sid, $${p+1}::uuid AS mid) q LEFT JOIN space_membership sm ON sm.space_id = q.sid AND sm.member_id = q.mid AND sm.revoked_at IS NULL`);
+      params.push(req.spaceId, req.memberId); p+=2;
     }
   }
-  return results;
+  const sql = legs.join(" UNION ALL ") + " ORDER BY ord";
+  const result = await client.query<{ ord: number; epoch: string | null; revoked_at: string | null }>(sql, params);
+  // result rows are in ord order
+  return result.rows.map((row, idx) => {
+    const req = requests[row.ord];
+    // idx should equal ord; use ord for mapping to survive any ordering guarantee
+    if (req.kind === "spaceMembership") {
+      return { request: req, epoch: row.epoch !== null ? toBigint(row.epoch) : null, revokedAt: row.revoked_at ?? null };
+    }
+    return { request: req, epoch: row.epoch !== null ? toBigint(row.epoch) : null };
+  });
 }

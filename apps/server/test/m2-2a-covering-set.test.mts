@@ -158,3 +158,26 @@ test("T1 grant bumps member epoch; T2 absent batch is null; batch exact bigint a
     assert.equal(cBefore, cAfter);
   });
 });
+
+test("batch executes exactly one query, preserves order/duplicates", async () => {
+  let calls = 0;
+  const fakeClient: any = {
+    query: async (sql: string, params: unknown[]) => {
+      calls++;
+      // simulate 2 rows: first absent, second present
+      return { rows: [{ ord: 0, epoch: null, revoked_at: null }, { ord: 1, epoch: "9007199254740996", revoked_at: null }, { ord: 2, epoch: "9007199254740996", revoked_at: null }], rowCount: 3 };
+    },
+  };
+  const reqs = [
+    { kind: "credential" as const, id: "00000000-0000-0000-0000-000000000001" },
+    { kind: "member" as const, id: "00000000-0000-0000-0000-000000000002" },
+    { kind: "member" as const, id: "00000000-0000-0000-0000-000000000002" },
+  ];
+  const out = await readEpochBatch(fakeClient, reqs);
+  assert.equal(calls, 1);
+  assert.equal(out.length, 3);
+  assert.equal(out[0].epoch, null);
+  assert.equal(out[1].epoch, 9007199254740996n);
+  assert.equal(out[2].epoch, 9007199254740996n);
+  assert.equal(typeof out[1].epoch, "bigint");
+});
