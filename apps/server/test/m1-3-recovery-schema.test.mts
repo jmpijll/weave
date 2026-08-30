@@ -473,10 +473,44 @@ test("recovery_challenge enforces the canonical TLS-origin representability floo
       [verifier, person, community, longUnicode, nonce, "device-long", 4],
       "recovery_challenge_canonical_tls_origin_check",
     );
+    // Reject a hostless path form (authority begins with `/`).
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "wss:///path", nonce, "device-hostless-path", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
+    // Reject a hostless query form (authority begins with `?`).
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "wss://?q=1", nonce, "device-hostless-query", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
+    // Reject a hostless fragment form (authority begins with `#`).
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "wss://#frag", nonce, "device-hostless-fragment", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
+    // Reject a whitespace-starting authority.
+    await expectReject(
+      pool, base.inserts,
+      [verifier, person, community, "wss:// host", nonce, "device-space", 4],
+      "recovery_challenge_canonical_tls_origin_check",
+    );
     // Accept the existing valid origin.
     await pool.query(
       base.inserts,
       [verifier, person, community, "wss://recovery.example:8443", nonce, "device-valid", 4],
+    );
+    // Accept a well-formed origin whose UTF-8 byte length is exactly 255 (the S9
+    // upper bound). Host uses valid multi-label DNS: 63+63+63+57-char labels
+    // joined by three dots (249 bytes), a single overlong label would not be a
+    // valid authority.
+    const exactly255 = `wss://${"a".repeat(63)}.${"a".repeat(63)}.${"a".repeat(63)}.${"a".repeat(57)}`;
+    assert.equal(Buffer.byteLength(exactly255, "utf8"), 255, "fixture must be exactly 255 UTF-8 bytes");
+    await pool.query(
+      base.inserts,
+      [verifier, person, community, exactly255, nonce, "device-exact-255", 4],
     );
   });
 });

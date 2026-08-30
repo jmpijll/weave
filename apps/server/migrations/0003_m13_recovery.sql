@@ -97,13 +97,21 @@ CREATE TABLE recovery_challenge (
   consumed_at               timestamptz,
   -- The canonical TLS origin must be a nonempty wss:// endpoint whose UTF-8
   -- byte length the frozen S9 transcript can represent (u16 length-prefix,
-  -- must be nonempty and at most 255 bytes). Full canonical TLS-origin parsing
-  -- and normalization stay at the M1.3.2 application boundary; this is only the
-  -- durable representability/scheme floor.
+  -- must be nonempty and at most 255 bytes), and whose authority/host begins
+  -- immediately after the scheme (the first char after `wss://` must be a
+  -- host character, not `/`, `?`, `#`, or whitespace) so hostless forms such
+  -- as `wss:///path`, `wss://?q`, `wss://#frag`, or `wss:// host` are refused.
+  -- Full canonical TLS-origin parsing and normalization stay at the M1.3.2
+  -- application boundary; this is only the durable representability/scheme/
+  -- host floor.
   CONSTRAINT recovery_challenge_canonical_tls_origin_check CHECK (
     canonical_tls_origin LIKE 'wss://%'
     AND length(canonical_tls_origin) > 6
     AND octet_length(canonical_tls_origin) <= 255
+    AND substring(canonical_tls_origin from 7 for 1) <> '/'
+    AND substring(canonical_tls_origin from 7 for 1) <> '?'
+    AND substring(canonical_tls_origin from 7 for 1) <> '#'
+    AND substring(canonical_tls_origin from 7 for 1) !~ '[[:space:]]'
   ),
   CONSTRAINT recovery_challenge_verifier_binding
     FOREIGN KEY (verifier_id, person_id, community_id)
