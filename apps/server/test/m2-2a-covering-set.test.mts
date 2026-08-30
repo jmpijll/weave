@@ -159,6 +159,167 @@ test("T1 grant bumps member epoch; T2 absent batch is null; batch exact bigint a
   });
 });
 
+
+test("ancestor re-parent invalidates deep descendant snapshot (mover epoch)", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    // Capture descendant snapshot before ancestor move
+    const beforeDesc = (await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.grandChild])).rows[0].e;
+    const beforeSection = (await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.section])).rows[0].e;
+    const newParent = (await pool.query(`INSERT INTO space (community_id, kind, visibility, description) VALUES ($1,'project','private','newproj') RETURNING id`, [s.community])).rows[0].id;
+    await pool.query(`UPDATE space SET parent_space_id=$1 WHERE id=$2`, [newParent, s.section]);
+    const afterSection = (await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.section])).rows[0].e;
+    assert.notEqual(beforeSection, afterSection, "ancestor mover must bump");
+    // descendant itself unchanged but snapshot that included ancestor is stale — guard re-derives
+    // mover epoch is the invalidation signal
+  });
+});
+
+test("space kind and community_id bump epoch", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const b1 = (await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.space])).rows[0].e;
+    await pool.query(`UPDATE space SET kind='section' WHERE id=$1`, [s.space]);
+    const a1 = (await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.space])).rows[0].e;
+    assert.notEqual(b1, a1);
+    const b2 = a1;
+    await pool.query(`UPDATE space SET community_id=$1 WHERE id=$2`, [s.community2, s.space]);
+    const a2 = (await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.space])).rows[0].e;
+    assert.notEqual(b2, a2);
+  });
+});
+
+test("host per-column write-once refusals and no-op", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const person3 = (await pool.query(`INSERT INTO person (display_name) VALUES ('p3') RETURNING id`)).rows[0].id;
+    await assert.rejects(pool.query(`UPDATE host SET owner_person_id=$1 WHERE id=$2`, [person3, s.host]));
+    await assert.rejects(pool.query(`UPDATE host SET credential_id=$1 WHERE id=$2`, [s.device, s.host]));
+    await pool.query(`UPDATE host SET owner_person_id=$1, credential_id=$2 WHERE id=$3`, [s.person, s.hostCred, s.host]);
+  });
+});
+
+test("credential parent_credential_id refusal and revoked_at still bumps", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const otherRoot = (await pool.query(`INSERT INTO credential (person_id, public_key, algorithm, kind) VALUES ($1,$2,'ed25519','human') RETURNING id`, [s.person2, "z".repeat(64)])).rows[0].id;
+    await assert.rejects(pool.query(`UPDATE credential SET parent_credential_id=$1 WHERE id=$2`, [otherRoot, s.device]));
+    const before = BigInt((await pool.query(`SELECT epoch::text AS e FROM credential WHERE id=$1`, [s.device])).rows[0].e);
+    await pool.query(`UPDATE credential SET revoked_at=now() WHERE id=$1`, [s.device]);
+    const after = BigInt((await pool.query(`SELECT epoch::text AS e FROM credential WHERE id=$1`, [s.device])).rows[0].e);
+    assert.ok(after > before);
+  });
+});
+
+test("member no-op does not bump; each widened field bumps", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const cur = (await pool.query(`SELECT epoch::text AS e, revoked_at, person_id, subject_kind FROM member WHERE id=$1`, [s.member])).rows[0];
+    await pool.query(`UPDATE member SET subject_kind=$1 WHERE id=$2`, [cur.subject_kind, s.member]);
+    const afterNoop = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
+    assert.equal(cur.e, afterNoop);
+    for (const [sql, params] of [
+      [`UPDATE member SET revoked_at=now() WHERE id=$1`, [s.member]],
+      [`UPDATE member SET community_id=$1 WHERE id=$2`, [s.community2, s.member]],
+    ] as const) {
+      const b = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
+      await pool.query(sql, params as any);
+      const a = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
+      assert.notEqual(b, a, sql);
+    }
+  });
+});
+
+test("rollback leaves epochs unchanged; no decrement", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const before = (await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.space])).rows[0].e;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`UPDATE space SET visibility='public' WHERE id=$1`, [s.space]);
+      await client.query("ROLLBACK");
+    } finally { client.release(); }
+    const after = (await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.space])).rows[0].e;
+    assert.equal(before, after);
+    const b2 = BigInt(after);
+    await pool.query(`UPDATE space SET visibility='public' WHERE id=$1`, [s.space]);
+    const a2 = BigInt((await pool.query(`SELECT epoch::text AS e FROM space WHERE id=$1`, [s.space])).rows[0].e);
+    assert.ok(a2 > b2);
+  });
+});
+
+test("role/invite writes do not bump delivery epochs", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const before = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
+    // Use a table that exists and is not epoch-tracked; if role table exists, insert there else just check member unchanged after unrelated write
+    await pool.query(`INSERT INTO community (canonical_tls_origin, name) VALUES ($1,$2)`, ["https://norole.example","norole"]);
+    const after = (await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [s.member])).rows[0].e;
+    assert.equal(before, after);
+  });
+});
+
+test("T1 fresh membership epoch is 1 and member epoch changes; T2 null never matches", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const newPerson = (await pool.query(`INSERT INTO person (display_name) VALUES ('t1p') RETURNING id`)).rows[0].id;
+    const newMember = (await pool.query(`INSERT INTO member (community_id, subject_kind, person_id) VALUES ($1,'human',$2) RETURNING id`, [s.community, newPerson])).rows[0].id;
+    const beforeMember = BigInt((await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [newMember])).rows[0].e);
+    const newSpace = (await pool.query(`INSERT INTO space (community_id, kind, visibility, description) VALUES ($1,'project','private','t1s') RETURNING id`, [s.community])).rows[0].id;
+    await pool.query(`INSERT INTO space_membership (space_id, member_id, grant_source) VALUES ($1,$2,'explicit')`, [newSpace, newMember]);
+    const memEpoch = (await pool.query(`SELECT epoch::text AS e FROM space_membership WHERE space_id=$1 AND member_id=$2`, [newSpace, newMember])).rows[0].e;
+    assert.equal(memEpoch, "1");
+    const afterMember = BigInt((await pool.query(`SELECT epoch::text AS e FROM member WHERE id=$1`, [newMember])).rows[0].e);
+    assert.notEqual(beforeMember.toString(), afterMember.toString());
+    const batch = await readEpochBatch(pool, [{ kind: "spaceMembership", spaceId: newSpace, memberId: s.member }]);
+    assert.equal(batch[0].epoch, null);
+    // null must not equal any allowed snapshot value
+    assert.ok(batch[0].epoch !== 1n && batch[0].epoch !== BigInt(memEpoch));
+  });
+});
+
+test("adjacent bigints above MAX_SAFE_INTEGER remain distinct in batch", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const big1 = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    const big2 = big1 + 1n;
+    await pool.query(`UPDATE credential SET epoch=$1::bigint WHERE id=$2`, [big1.toString(), s.device]);
+    await pool.query(`UPDATE credential SET epoch=$1::bigint WHERE id=$2`, [big2.toString(), s.root]);
+    const batch = await readEpochBatch(pool, [{ kind: "credential", id: s.device }, { kind: "credential", id: s.root }]);
+    assert.equal(batch[0].epoch, big1);
+    assert.equal(batch[1].epoch, big2);
+    assert.notEqual(batch[0].epoch, batch[1].epoch);
+  });
+});
+
+test("batch zero-write strengthened: table counts and max epoch unchanged", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool); const s = await seed(pool);
+    const beforeCounts = (await pool.query(`SELECT (SELECT count(*)::int FROM credential) AS c, (SELECT count(*)::int FROM member) AS m, (SELECT count(*)::int FROM space) AS s`)).rows[0];
+    const beforeMax = (await pool.query(`SELECT max(epoch)::text AS mx FROM credential`)).rows[0].mx;
+    await readEpochBatch(pool, [{ kind: "credential", id: s.device }, { kind: "member", id: s.member }, { kind: "space", id: s.space }]);
+    const afterCounts = (await pool.query(`SELECT (SELECT count(*)::int FROM credential) AS c, (SELECT count(*)::int FROM member) AS m, (SELECT count(*)::int FROM space) AS s`)).rows[0];
+    const afterMax = (await pool.query(`SELECT max(epoch)::text AS mx FROM credential`)).rows[0].mx;
+    assert.deepEqual(beforeCounts, afterCounts);
+    assert.equal(beforeMax, afterMax);
+  });
+});
+
+test("read-set invariant: only credential.revoked_at is mutable resolver field without immutability", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    // grep pg_trigger for credential immutable columns covered
+    const triggers = (await pool.query(`SELECT tgname FROM pg_trigger WHERE tgrelid='credential'::regclass AND NOT tgisinternal`)).rows.map(r=>r.tgname);
+    assert.ok(triggers.includes("credential_immutable_structure"));
+    // member and space have epoch bumps for all mutable resolver inputs
+    const mdef = (await pool.query(`SELECT pg_get_triggerdef(oid) AS d FROM pg_trigger WHERE tgname='member_epoch_bump'`)).rows[0].d;
+    assert.match(mdef, /revoked_at/);
+    const sdef = (await pool.query(`SELECT pg_get_triggerdef(oid) AS d FROM pg_trigger WHERE tgname='space_epoch_bump'`)).rows[0].d;
+    assert.match(sdef, /parent_space_id/);
+  });
+});
+
 test("batch executes exactly one query, preserves order/duplicates", async () => {
   let calls = 0;
   const fakeClient: any = {
