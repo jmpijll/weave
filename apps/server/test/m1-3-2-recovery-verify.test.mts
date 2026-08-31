@@ -6,6 +6,7 @@ import type { KeyObject } from "node:crypto";
 import http from "node:http";
 import type { ClientRequest } from "node:http";
 import { createWeaveServer } from "../src/index.ts";
+import type { ServerOptions, TestOnlyV1Operation } from "../src/index.ts";
 import { createDatabaseConfig, createDatabasePool } from "../src/db/pool.ts";
 import { runMigrations } from "../src/db/migrate.ts";
 import {
@@ -248,8 +249,14 @@ async function withServer<T>(
   fn: (base: string) => Promise<T>,
   admission?: { maxInFlight: number; bodyDeadlineMs: number },
   readiness?: () => Promise<boolean>,
+  boundaryOptions: Pick<ServerOptions, "outcomeLogger" | "testOnlyV1Operations"> = {},
 ): Promise<T> {
-  const server = createWeaveServer({ pool, readiness: readiness ?? (async () => true), admission });
+  const server = createWeaveServer({
+    pool,
+    readiness: readiness ?? (async () => true),
+    admission,
+    ...boundaryOptions,
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const port = typeof address === "object" && address !== null ? address.port : 0;
@@ -290,7 +297,7 @@ function openRawRequest(
   opts?: { method?: string; contentType?: string; partialBody?: string },
 ): {
   req: ClientRequest;
-  response: Promise<{ status: number; body: string }>;
+  response: Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }>;
 } {
   const req = http.request({
     hostname: "127.0.0.1",
@@ -299,13 +306,13 @@ function openRawRequest(
     path: "/v1/identity/recovery/verify",
     headers: { "content-type": opts?.contentType ?? "application/json" },
   });
-  const response = new Promise<{ status: number; body: string }>((resolve, reject) => {
+  const response = new Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }>((resolve, reject) => {
     req.on("response", (res) => {
       let raw = "";
       res.on("data", (chunk) => {
         raw += chunk;
       });
-      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: raw }));
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: raw, headers: res.headers }));
       res.on("error", reject);
     });
     req.on("error", reject);
@@ -317,9 +324,48 @@ function openRawRequest(
 
 function openPartialRequest(base: string): {
   req: ClientRequest;
-  response: Promise<{ status: number; body: string }>;
+  response: Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }>;
 } {
   return openRawRequest(base);
+}
+
+type CapturedLog = Record<string, unknown>;
+
+async function captureLogs<T>(fn: () => Promise<T>): Promise<{ value: T; logs: CapturedLog[] }> {
+  const original = console.log;
+  const lines: string[] = [];
+  console.log = (...values: unknown[]) => {
+    if (values.length === 1 && typeof values[0] === "string") lines.push(values[0]);
+  };
+  try {
+    const value = await fn();
+    const logs = lines.map((line) => JSON.parse(line) as CapturedLog);
+    return { value, logs };
+  } finally {
+    console.log = original;
+  }
+}
+
+function events(logs: CapturedLog[], event: string): CapturedLog[] {
+  return logs.filter((entry) => entry.event === event);
+}
+
+function recordOutcomes(logs: CapturedLog[]): NonNullable<ServerOptions["outcomeLogger"]> {
+  return (event, fields) => logs.push({ event, ...fields });
+}
+
+function assertS8LogShape(event: CapturedLog, requestId: string): void {
+  assert.deepEqual(Object.keys(event).sort(), ["durationMs", "event", "outcome", "requestId", "route", "status"]);
+  assert.equal(event.requestId, requestId);
+  assert.equal(typeof event.durationMs, "number");
+}
+
+function assertTransportLogShape(event: CapturedLog): void {
+  assert.deepEqual(Object.keys(event).sort(), ["correlationId", "durationMs", "event", "outcome", "retryAfter", "route", "status"]);
+  assert.equal(event.status, 503);
+  assert.equal(event.retryAfter, "1");
+  assert.ok(typeof event.correlationId === "string" && event.correlationId.length > 0);
+  assert.equal(typeof event.durationMs, "number");
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1049,305 @@ test("wrong-media POST with a never-ending body responds 400 immediately and the
     await assertZeroMutation(pool, before);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Shared HTTP hardening regressions, first observed RED before the boundary
+// owned terminal outcome logging and transport retry signaling.
+// ---------------------------------------------------------------------------
+test("S8 refusal and generic unknown /v1 each emit one correlated redacted outcome", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    await seedSetup(pool);
+    const sentinel = "body-header-query-sentinel";
+    const { value, logs } = await captureLogs(async () =>
+      await withServer(pool, async (base) => {
+        const refusal = await post(
+          base,
+          "/v1/identity/recovery/verify",
+          { sentinel },
+          { "content-type": "text/plain", authorization: `Bearer ${sentinel}` },
+        );
+        const unknown = await fetch(`${base}/v1/private-${sentinel}?q=${sentinel}`);
+        return { refusal, unknown };
+      }),
+    );
+
+    const refusalBody = (await value.refusal.json()) as { error: { requestId: string } };
+    const unknownBody = (await value.unknown.json()) as { error: { requestId: string } };
+    const outcomeEvents = events(logs, "http.outcome");
+    assert.equal(outcomeEvents.length, 2, "every S8 terminal response must log once");
+    assert.deepEqual(
+      outcomeEvents.map((event) => event.requestId).sort(),
+      [refusalBody.error.requestId, unknownBody.error.requestId].sort(),
+      "each S8 log must use the returned requestId as its correlation",
+    );
+    assert.ok(logs.every((event) => !JSON.stringify(event).includes(sentinel)), "request material must never be logged");
+  });
+});
+
+test("each transport 503 has a retry hint and one server-only correlated outcome", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    await seedSetup(pool);
+    const { value, logs } = await captureLogs(async () =>
+      await withServer(
+        pool,
+        async (base) => await post(base, "/v1/identity/recovery/verify", {}),
+        undefined,
+        async () => false,
+      ),
+    );
+    assert.equal(value.status, 503);
+    assert.ok(value.headers.get("retry-after"), "transport 503 must give bounded retry guidance");
+    const body = (await value.json()) as { status: string; requestId?: unknown; error?: unknown };
+    assert.deepEqual(body, { status: "not_ready" });
+    const transportEvents = events(logs, "http.transport_503");
+    assert.equal(transportEvents.length, 1, "transport refusal must log exactly once");
+    assert.equal(transportEvents[0].status, 503);
+    assert.ok(typeof transportEvents[0].correlationId === "string" && transportEvents[0].correlationId.length > 0);
+    assert.equal(body.requestId, undefined, "server-only correlation must not appear on the wire");
+  });
+});
+
+test("catch-all is one redacted transport 503 and releases its admission slot", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    await seedSetup(pool);
+    const exceptionSentinel = "catch-all-exception-sentinel";
+    let calls = 0;
+    const { value, logs } = await captureLogs(async () =>
+      await withServer(
+        pool,
+        async (base) => {
+          const first = await post(base, "/v1/identity/recovery/verify", {});
+          const second = await post(base, "/v1/identity/recovery/verify", {});
+          return { first, second };
+        },
+        { maxInFlight: 1, bodyDeadlineMs: 100 },
+        async () => {
+          calls++;
+          throw new Error(exceptionSentinel);
+        },
+      ),
+    );
+    assert.equal(value.first.status, 503);
+    assert.equal(value.second.status, 503, "a catch-all must release its admission slot");
+    assert.equal(calls, 2, "the second request must reach readiness after release");
+    const transportEvents = events(logs, "http.transport_503");
+    assert.equal(transportEvents.length, 2, "each catch-all must emit exactly one terminal log");
+    assert.ok(logs.every((event) => !JSON.stringify(event).includes(exceptionSentinel)));
+  });
+});
+
+test("all S8 terminal families use one allowlisted requestId-correlated outcome", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { body } = await seedSetup(pool);
+    const before = await snapshot(pool);
+    const logs: CapturedLog[] = [];
+    await withServer(
+      pool,
+      async (base) => {
+        const cases: Array<() => Promise<Response>> = [
+          async () => await fetch(`${base}/v1/identity/recovery/verify`, { method: "GET" }),
+          async () => await post(base, "/v1/identity/recovery/verify", "redaction-body-sentinel", { "content-type": "text/plain" }),
+          async () => await post(base, "/v1/identity/recovery/verify", JSON.stringify({ padding: "x".repeat(9_000) })),
+          async () => await post(base, "/v1/identity/recovery/verify", Buffer.from([0xc3, 0x28])),
+          async () => await post(base, "/v1/identity/recovery/verify", "{"),
+          async () => await post(base, "/v1/identity/recovery/verify", {}),
+          async () => await post(base, "/v1/identity/recovery/verify", { ...body, challengeId: randomUUID() }),
+          async () => await post(base, "/v1/identity/recovery/verify", body),
+        ];
+        const expectedStatuses = [400, 400, 400, 400, 400, 400, 404, 200];
+        for (let index = 0; index < cases.length; index++) {
+          const response = await cases[index]();
+          assert.equal(response.status, expectedStatuses[index]);
+          assert.equal(response.headers.get("retry-after"), null, "S8 outcomes must not carry transport retry guidance");
+          const json = (await response.json()) as { error?: { requestId: string }; requestId?: string };
+          const requestId = json.error?.requestId ?? json.requestId;
+          assert.ok(requestId, "every S8 response and verified success has its requestId");
+          const event = logs[index];
+          assertS8LogShape(event, requestId as string);
+        }
+      },
+      { maxInFlight: 1, bodyDeadlineMs: 1_000 },
+      undefined,
+      { outcomeLogger: recordOutcomes(logs) },
+    );
+    assert.equal(logs.length, 8);
+    assert.ok(logs.every((event) => !JSON.stringify(event).includes("redaction-body-sentinel")));
+    await assertZeroMutation(pool, before);
+  });
+});
+
+test("capacity, readiness, deadline, and catch-all each use the one transport-503 writer", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { body } = await seedSetup(pool);
+    const before = await snapshot(pool);
+
+    const readinessLogs: CapturedLog[] = [];
+    await withServer(
+      pool,
+      async (base) => {
+        const response = await post(base, "/v1/identity/recovery/verify", body);
+        assert.equal(response.status, 503);
+        assert.equal(response.headers.get("retry-after"), "1");
+        assert.deepEqual(await response.json(), { status: "not_ready" });
+      },
+      undefined,
+      async () => false,
+      { outcomeLogger: recordOutcomes(readinessLogs) },
+    );
+    assert.equal(readinessLogs.length, 1);
+    assertTransportLogShape(readinessLogs[0]);
+    assert.equal(readinessLogs[0].outcome, "not_ready");
+
+    const capacityLogs: CapturedLog[] = [];
+    await withServer(
+      pool,
+      async (base) => {
+        const held = openPartialRequest(base);
+        void held.response.catch(() => {});
+        await sleep(100);
+        const saturated = await post(base, "/v1/identity/recovery/verify", body);
+        assert.equal(saturated.status, 503);
+        assert.equal(saturated.headers.get("retry-after"), "1");
+        assert.deepEqual(await saturated.json(), { status: "not_ready" });
+        held.req.destroy();
+        await sleep(100);
+      },
+      { maxInFlight: 1, bodyDeadlineMs: 1_000 },
+      undefined,
+      { outcomeLogger: recordOutcomes(capacityLogs) },
+    );
+    assert.equal(events(capacityLogs, "http.transport_503").length, 1);
+    assertTransportLogShape(capacityLogs[0]);
+    assert.equal(capacityLogs[0].outcome, "capacity");
+
+    const deadlineLogs: CapturedLog[] = [];
+    await withServer(
+      pool,
+      async (base) => {
+        const held = openPartialRequest(base);
+        const response = await held.response;
+        assert.equal(response.status, 503);
+        assert.equal(response.headers["retry-after"], "1");
+        assert.deepEqual(JSON.parse(response.body), { status: "not_ready" });
+      },
+      { maxInFlight: 1, bodyDeadlineMs: 50 },
+      undefined,
+      { outcomeLogger: recordOutcomes(deadlineLogs) },
+    );
+    assert.equal(deadlineLogs.length, 1);
+    assertTransportLogShape(deadlineLogs[0]);
+    assert.equal(deadlineLogs[0].outcome, "deadline");
+
+    const catchLogs: CapturedLog[] = [];
+    const exceptionSentinel = "transport-catchall-sentinel";
+    await withServer(
+      pool,
+      async (base) => {
+        const response = await post(base, "/v1/identity/recovery/verify", body);
+        assert.equal(response.status, 503);
+        assert.equal(response.headers.get("retry-after"), "1");
+        assert.deepEqual(await response.json(), { status: "not_ready" });
+      },
+      undefined,
+      async () => {
+        throw new Error(exceptionSentinel);
+      },
+      { outcomeLogger: recordOutcomes(catchLogs) },
+    );
+    assert.equal(catchLogs.length, 1);
+    assertTransportLogShape(catchLogs[0]);
+    assert.equal(catchLogs[0].outcome, "catch_all");
+    assert.ok(catchLogs.every((event) => !JSON.stringify(event).includes(exceptionSentinel)));
+    await assertZeroMutation(pool, before);
+  });
+});
+
+test("two test-only operations share one server boundary while another server stays isolated", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const logs: CapturedLog[] = [];
+    let releaseFirst: (() => void) | undefined;
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstStarted: (() => void) | undefined;
+    const firstAdmitted = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const operations = new Map<string, TestOnlyV1Operation>([
+      [
+        "/v1/__test/first",
+        {
+          route: "test.first",
+          handle: async (operation) => {
+            firstStarted?.();
+            await firstReleased;
+            operation.success(200, { status: "ok" }, "ok");
+          },
+        },
+      ],
+      [
+        "/v1/__test/second",
+        {
+          route: "test.second",
+          handle: async (operation) => operation.success(200, { status: "ok" }, "ok"),
+        },
+      ],
+    ]);
+    await withServer(
+      pool,
+      async (base) => {
+        const first = fetch(`${base}/v1/__test/first`);
+        await firstAdmitted;
+
+        const isolated = createWeaveServer({
+          pool,
+          readiness: async () => true,
+          admission: { maxInFlight: 1, bodyDeadlineMs: 1_000 },
+          testOnlyV1Operations: operations,
+          outcomeLogger: recordOutcomes(logs),
+        });
+        await new Promise<void>((resolve) => isolated.listen(0, "127.0.0.1", resolve));
+        const address = isolated.address();
+        const port = typeof address === "object" && address !== null ? address.port : 0;
+        let firstResponse: Response | undefined;
+        try {
+          assert.equal(
+            (await fetch(`http://127.0.0.1:${port}/v1/__test/second`)).status,
+            200,
+            "a distinct server must admit while the first server remains saturated",
+          );
+          const saturated = await fetch(`${base}/v1/__test/second`);
+          assert.equal(saturated.status, 503, "second operation must share the first operation's limit");
+          assert.equal(saturated.headers.get("retry-after"), "1");
+          const unknown = await fetch(`${base}/v1/unknown-path-with-secret?query=secret`);
+          assert.equal(unknown.status, 404, "generic unknown /v1 must not consume an admission slot");
+        } finally {
+          releaseFirst?.();
+          firstResponse = await first;
+          await new Promise<void>((resolve, reject) => isolated.close((error) => (error ? reject(error) : resolve())));
+        }
+        assert.equal(firstResponse?.status, 200);
+        assert.equal((await fetch(`${base}/v1/__test/second`)).status, 200);
+      },
+      { maxInFlight: 1, bodyDeadlineMs: 1_000 },
+      undefined,
+      { outcomeLogger: recordOutcomes(logs), testOnlyV1Operations: operations },
+    );
+    assert.equal(events(logs, "http.transport_503").length, 1);
+    const unknownEvents = events(logs, "http.outcome").filter((event) => event.route === "v1.unknown");
+    assert.equal(unknownEvents.length, 1);
+    assertS8LogShape(unknownEvents[0], String(unknownEvents[0].requestId));
+    assert.ok(logs.every((event) => !JSON.stringify(event).includes("unknown-path-with-secret")));
+    assert.ok(logs.every((event) => !JSON.stringify(event).includes("query=secret")));
+  });
+});
+
 test("buildRecoveryTranscript accepts only integer environment codes 1..4", () => {
   const base = {
     domain: DOMAIN,

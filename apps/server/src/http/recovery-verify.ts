@@ -50,7 +50,7 @@
  * holding the connection: on oversize / deadline the request is destroyed.
  */
 
-import { createPublicKey, randomUUID } from "node:crypto";
+import { createPublicKey } from "node:crypto";
 import { verify as verifySignature } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
@@ -62,6 +62,7 @@ import {
   resolveRecoveryError,
 } from "@weave/protocol";
 import type { RecoveryErrorCode, RecoveryVerifyRequest } from "@weave/protocol";
+import type { V1BoundaryController } from "./boundary.ts";
 
 /** The minimal database surface this route needs: parameterized reads only. */
 export type Queryable = {
@@ -343,19 +344,11 @@ const SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 export interface RecoveryVerifyContext {
   db?: Queryable;
   ready?: () => Promise<boolean>;
-  /**
-   * Bounded in-process admission control. Defaults are the OWASP-tensioned
-   * values: at most 8 in-flight verifications per process (leaving capacity
-   * under a 10-connection pool) and a 10-second absolute raw-body deadline.
-   */
-  admission?: { maxInFlight: number; bodyDeadlineMs: number };
+  /** Server-owned `/v1` admission, terminal-response, and outcome-log boundary. */
+  boundary: V1BoundaryController;
 }
 
-/** Bounded in-process admission control (see `RecoveryVerifyContext`). */
-const DEFAULT_ADMISSION = Object.freeze({ maxInFlight: 8, bodyDeadlineMs: 10_000 });
-let inFlight = 0;
-
-type RawBody = Buffer | "oversize" | "timeout";
+type RawBody = Buffer | "oversize" | "timeout" | "aborted";
 
 /** Wire the route into a `node:http` request/response pair. */
 export async function handleRecoveryVerify(
@@ -363,120 +356,69 @@ export async function handleRecoveryVerify(
   response: ServerResponse,
   ctx: RecoveryVerifyContext,
 ): Promise<void> {
-  const admission = ctx.admission ?? DEFAULT_ADMISSION;
-
-  // Admission CAPACITY check runs FIRST — before `ready()` and before any
-  // `requestId` is generated. A saturated request performs no DB and no crypto
-  // work and returns the transport not-ready 503 (no requestId by design).
-  if (inFlight >= admission.maxInFlight) {
-    // A saturated request is refused without reading its body; destroy the
-    // connection once the transport 503 flushes so the unconsumed body can
-    // never retain or reset the connection.
-    dropAfterFlush(request, response);
-    writeNotReady(response);
-    return;
-  }
-  inFlight++;
-  try {
-    // Availability gate: no DB/migrations or a failed readiness probe means the
-    // endpoint is unavailable (503, transport, no requestId) and never parses or
-    // evaluates a request. Runs inside the granted slot. The request body may
-    // still be open, so the connection is dropped after the transport flush.
+  await ctx.boundary.execute(request, response, "recovery.verify", async (operation) => {
+    // Availability failure is a transport outcome. It must occur after the
+    // shared boundary acquired its one server-owned slot and before parsing.
     if (!ctx.db || !ctx.ready || !(await ctx.ready())) {
-      dropAfterFlush(request, response);
-      writeNotReady(response);
+      operation.transport503("not_ready");
       return;
     }
 
-    // A slot is granted and the DB is ready: now a requestId may be generated.
-    // It is a diagnostic correlation id only and is never emitted on the
-    // transport-503 paths above.
-    const requestId = randomUUID();
-
     // S8 method / media-type guards. A wrong-method or wrong-media request may
-    // still carry an unread body; drop the connection after the flush so a slow
-    // body cannot hold the socket past the bounded-read path.
+    // still carry an unread body, so preserve the established flush-drop rule.
     if (request.method !== "POST") {
-      dropAfterFlush(request, response);
-      writeEnvelope(response, "bad_request", requestId);
+      operation.dropAfterFlush();
+      writeRecoveryEnvelope(operation, "bad_request");
       return;
     }
     const contentType = request.headers["content-type"];
     const mediaType = typeof contentType === "string" ? contentType.split(";")[0].trim().toLowerCase() : "";
     if (mediaType !== "application/json") {
-      dropAfterFlush(request, response);
-      writeEnvelope(response, "bad_request", requestId);
+      operation.dropAfterFlush();
+      writeRecoveryEnvelope(operation, "bad_request");
       return;
     }
 
-    // Bounded raw-body read. The slot is released on every completion/error/
-    // abort via `finally`, and an unconsumed body never retains the connection.
-    const raw = await readBody(request, MAX_BODY_BYTES, admission.bodyDeadlineMs);
+    const raw = await readBody(request, MAX_BODY_BYTES, operation.admission.bodyDeadlineMs);
     if (raw === "oversize") {
-      // Destroy the dropped connection after the transport response flushes so
-      // the unconsumed remainder can never hold the connection.
-      dropAfterFlush(request, response);
-      writeEnvelope(response, "bad_request", requestId);
+      operation.dropAfterFlush();
+      writeRecoveryEnvelope(operation, "bad_request");
       return;
     }
     if (raw === "timeout") {
-      dropAfterFlush(request, response);
-      writeNotReady(response);
+      operation.transport503("deadline");
       return;
     }
+    if (raw === "aborted") return;
     let text: string;
     try {
-      // Fatal decode: any invalid UTF-8 byte sequence rejects the raw body.
       text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
     } catch {
-      writeEnvelope(response, "bad_request", requestId);
+      writeRecoveryEnvelope(operation, "bad_request");
       return;
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
     } catch {
-      writeEnvelope(response, "bad_request", requestId);
+      writeRecoveryEnvelope(operation, "bad_request");
       return;
     }
     const parsedRequest = parseRecoveryVerifyRequest(parsed);
     if (!parsedRequest.ok) {
-      writeEnvelope(response, parsedRequest.code, requestId);
+      writeRecoveryEnvelope(operation, parsedRequest.code);
       return;
     }
-    const outcome = await evaluateRecoveryRequest(parsedRequest.value, ctx.db, requestId);
+    const outcome = await evaluateRecoveryRequest(parsedRequest.value, ctx.db, operation.requestId);
     if (!outcome.ok) {
-      writeEnvelope(response, outcome.code, requestId);
+      writeRecoveryEnvelope(operation, outcome.code);
       return;
     }
-    writeJson(response, 200, { status: "verified", requestId });
-  } catch {
-    // Any abort (including a client reset during the body read) is a harmless
-    // not-ready transport response; slot release is guaranteed by `finally`.
-    writeNotReady(response);
-    if (!request.destroyed) request.destroy();
-  } finally {
-    inFlight--;
-  }
-}
-
-/**
- * Ensure a bounded raw-body read never leaves an unconsumed body holding the
- * connection. Called only on the oversize / deadline paths, AFTER the transport
- * response is written: the shared request socket is destroyed once the response
- * has flushed, so the connection is released instead of being retained by an
- * unread body.
- */
-function dropAfterFlush(request: IncomingMessage, response: ServerResponse): void {
-  if (request.destroyed || response.writableEnded) {
-    if (!request.destroyed) request.destroy();
-    return;
-  }
-  response.once("finish", () => {
-    if (!request.destroyed) request.destroy();
+    operation.success(200, { status: "verified", requestId: operation.requestId }, "verified");
   });
 }
 
+/** Read a bounded raw body, distinguishing deadline expiry from client abort. */
 function readBody(request: IncomingMessage, max: number, deadlineMs: number): Promise<RawBody> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
@@ -506,8 +448,8 @@ function readBody(request: IncomingMessage, max: number, deadlineMs: number): Pr
       chunks.push(buffer);
     };
     const onEnd = (): void => finish(Buffer.concat(chunks));
-    const onError = (): void => finish("timeout");
-    const onAborted = (): void => finish("timeout");
+    const onError = (): void => finish("aborted");
+    const onAborted = (): void => finish("aborted");
     timer = setTimeout(() => finish("timeout"), deadlineMs);
     request.on("data", onData);
     request.on("end", onEnd);
@@ -517,21 +459,11 @@ function readBody(request: IncomingMessage, max: number, deadlineMs: number): Pr
 }
 
 /** Generic S8 `not_found` envelope for an unknown `/v1/*` path (ADR §M1.3.2). */
-export function sendRecoveryV1Unknown(response: ServerResponse): void {
-  writeEnvelope(response, "not_found", randomUUID());
+export function sendRecoveryV1Unknown(response: ServerResponse, boundary: V1BoundaryController): void {
+  boundary.unknown(response);
 }
 
-function writeJson(response: ServerResponse, status: number, body: Record<string, unknown>): void {
-  if (response.writableEnded) return;
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  response.end(JSON.stringify(body));
-}
-
-function writeEnvelope(response: ServerResponse, code: RecoveryErrorCode, requestId: string): void {
+function writeRecoveryEnvelope(operation: import("./boundary.ts").V1Operation, code: RecoveryErrorCode): void {
   const { status } = resolveRecoveryError(code);
-  writeJson(response, status, { error: { code, message: MESSAGE[code], requestId } });
-}
-
-function writeNotReady(response: ServerResponse): void {
-  writeJson(response, 503, { status: "not_ready" });
+  operation.s8(status, code, MESSAGE[code]);
 }
