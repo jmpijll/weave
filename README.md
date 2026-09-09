@@ -70,12 +70,18 @@ failure, and fails loudly if the rollback itself fails.
 
 The Compose skeleton starts a `postgres:16-alpine` database (the Weave backing
 store) with a named `weave-data` volume and a `server` service built from the
-`Dockerfile`. The server is a minimal long-running entry point exposing only a
-`/health` liveness endpoint (no product API, auth, or persistence), with a
-Compose healthcheck and `restart: unless-stopped`.
+`Dockerfile`. The `server` is wired to the database via `DATABASE_URL`; on
+startup it applies the checked-in PostgreSQL migrations and exposes two probes:
+`/health` for liveness (always 200 while the process runs, no product API or
+auth) and `/ready` for readiness (200 only after migrations applied and a live
+`SELECT 1` succeeds, else 503). The Compose healthcheck qualifies `/ready`, so
+`docker compose up --wait` only reports success once migrations and the
+database check have passed, while the container `restart: unless-stopped`
+policy and `/health` retain liveness semantics.
 
 For this repository foundation, a clean clone can import and run the Node
-server entry point immediately after installation:
+server entry point immediately after installation (it runs liveness-only,
+serving `/health`, until a `DATABASE_URL` is supplied):
 
 ```sh
 git clone https://github.com/jmpijll/weave.git

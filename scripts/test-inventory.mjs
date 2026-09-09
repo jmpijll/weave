@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Single reviewed test inventory for Weave M0.
+ * Single reviewed test inventory for Weave.
  *
  * The package `test` command invokes exactly this module once. It is the sole
- * place that names the six existing test layers, so the T4 and T9 command
+ * place that names the eight existing test layers, so the T4 and T9 command
  * strings can no longer drift apart:
  *
  *   1. verify-workspaces.mjs            workspace wiring (protocol dependency,
@@ -13,6 +13,37 @@
  *   4. evidence-contract.test.mjs       evidence contract regression (script)
  *   5. node-runtime-regression.test.mjs installer Node floor regression (script)
  *   6. t4-codex-delivery-contract.test.mjs T4 delivery contract (node:test)
+ *   7. m1-1-migrations.test.mts        M1.1 PostgreSQL migration + credential-tree
+ *                                      integration (node:test; needs DATABASE_URL)
+ *   8. m1-2-membership-access.test.mts M1.2 membership/role/space-access PostgreSQL
+ *                                      integration (node:test; needs DATABASE_URL)
+ *   9. m1-3-recovery-schema.test.mts   M1.3.1 recovery verifier/challenge schema +
+ *                                      persisted v1 version metadata (node:test;
+ *                                      needs DATABASE_URL)
+ *  10. m1-3-2-recovery-verify.test.mts  M1.3.2 read-only POST /v1/identity/recovery/verify
+ *                                      app-boundary negative + conformance suite
+ *                                      (node:test; needs DATABASE_URL)
+ *  11. m1-3-3-credential-ancestry.test.mts M1.3.3 read-time credential ancestry
+ *                                      resolver (S7): valid human-device/agent
+ *                                      resolution, denied on root/host/target
+ *                                      revocation, cycle/over-depth/cross-person/
+ *                                      malformed negatives, zero read mutation
+ *                                      (node:test; needs DATABASE_URL)
+ *  12. m2-1-epoch-bump.test.mts        M2.1 database-enforced delivery epochs:
+ *                                      R1/R2/R3/R4/R5 bump coverage, member-
+ *                                      epoch grant/revoke invalidation, no-op
+ *                                      no-bump, atomic rollback, zero read
+ *                                      mutation, management-authority no-bump
+ *                                      (node:test; needs DATABASE_URL)
+ *  13. m3-1-enrollment-schema.test.mts  M3.1 enrollment-schema + protocol-type
+ *                                      groundwork: pairing_token replay-guard
+ *                                      table (6 frozen columns, strict 64-char
+ *                                      lowercase-hex host key, FKs, consume
+ *                                      state) and the four additive host columns
+ *                                      (capabilities JSONB, last_seen_at,
+ *                                      constrained status, paired_at) with
+ *                                      production defaults (node:test; needs
+ *                                      DATABASE_URL)
  *
  * Each layer runs as its own child process with the pinned `node` binary
  * (process.execPath), so a failure is isolated and attributable. A non-zero
@@ -31,6 +62,14 @@ const INVENTORY = [
   { name: "evidence-contract.test.mjs", args: ["scripts/evidence-contract.test.mjs"] },
   { name: "node-runtime-regression.test.mjs", args: ["scripts/node-runtime-regression.test.mjs"] },
   { name: "t4-codex-delivery-contract.test.mjs", args: ["--test", "scripts/t4-codex-delivery-contract.test.mjs"] },
+  { name: "m1-1-migrations.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-1-migrations.test.mts"] },
+  { name: "m1-2-membership-access.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-2-membership-access.test.mts"] },
+  { name: "m1-3-recovery-schema.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-recovery-schema.test.mts"] },
+  { name: "m1-3-2-recovery-verify.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-2-recovery-verify.test.mts"] },
+  { name: "m1-3-3-credential-ancestry.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m1-3-3-credential-ancestry.test.mts"] },
+  { name: "m2-1-epoch-bump.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m2-1-epoch-bump.test.mts"] },
+  { name: "m3-1-enrollment-schema.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-1-enrollment-schema.test.mts"] },
+  { name: "m2-2a-covering-set.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m2-2a-covering-set.test.mts"] },
 ];
 
 let failed = 0;

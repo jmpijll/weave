@@ -1,4 +1,6 @@
 /** The protocol package is the compile-time contract shared by all programs. */
+export * from "./recovery/index.ts";
+
 export const PROTOCOL_NAME = "weave" as const;
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -105,6 +107,12 @@ export interface HarnessCapabilities {
 
 export interface HostCapabilities {
   harnesses: HarnessCapabilities[];
+}
+
+export type HostStatus = "ready" | "degraded" | "offline";
+
+export interface HostStatusPayload {
+  status: HostStatus;
 }
 
 export interface AgentDefinition {
@@ -246,11 +254,27 @@ export interface ContentReplacePayload {
   bytes: string;
 }
 
+/**
+ * `EnrollHostPayload` — purpose-specific HTTP-only shape for a future
+ * `POST /v1/hosts/enroll`-class host enrollment request (M3.1 §2). Erasable
+ * compile-time type only: no `ProtocolEnvelope`, no `WireMessage` membership,
+ * no parsing/verification/routing/issuance/consumption. The signed-enrollment
+ * transcript and signature scheme are M1.3.A-dependent and selected later.
+ * The pairing token is replay protection, not a bearer credential — authority
+ * comes from the owner-authorized, host-public-key-bound request.
+ */
+export interface EnrollHostPayload {
+  tokenId: string;
+  ownerCredentialId: string;
+  hostPublicKey: string;
+  signature: string;
+}
+
 export type ChallengeMessage = ProtocolEnvelope<"challenge", ChallengePayload>;
 export type ClientAuthenticateMessage = ProtocolEnvelope<"client.authenticate", AuthenticatePayload>;
 export type HostAuthenticateMessage = ProtocolEnvelope<"host.authenticate", AuthenticatePayload>;
 export type HostCapabilitiesMessage = ProtocolEnvelope<"host.capabilities", HostCapabilities>;
-export type HostStatusMessage = ProtocolEnvelope<"host.status", { status: "ready" | "degraded" | "offline" }>;
+export type HostStatusMessage = ProtocolEnvelope<"host.status", HostStatusPayload>;
 export type AgentStartMessage = ProtocolEnvelope<"agent.start", AgentStartPayload>;
 export type AgentStopMessage = ProtocolEnvelope<"agent.stop", { agentId: string }>;
 export type AgentDefinitionMessage = ProtocolEnvelope<"agent.definition", { definition: AgentDefinition }>;
@@ -266,7 +290,6 @@ export type TurnInterruptMessage = ProtocolEnvelope<"turn.interrupt", { sessionI
 export type MessageAckMessage = ProtocolEnvelope<"message.ack", { memberId: string; spaceId: string; messageId: string }>;
 export type ContentFetchMessage = ProtocolEnvelope<"content.fetch", ContentFetchPayload>;
 export type ContentReplaceMessage = ProtocolEnvelope<"content.replace", ContentReplacePayload>;
-
 export type WireMessage =
   | ChallengeMessage
   | ClientAuthenticateMessage

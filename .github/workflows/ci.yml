@@ -10,6 +10,22 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: weave
+          POSTGRES_USER: weave
+          POSTGRES_PASSWORD: weave
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U weave -d weave"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=15
+    env:
+      DATABASE_URL: postgres://weave:weave@localhost:5432/weave
     steps:
       - name: Check out
         uses: actions/checkout@v4
