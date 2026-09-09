@@ -30,7 +30,7 @@ function swapDatabase(url: string, database: string): string {
   return parsed.toString();
 }
 
-async function withFreshDatabase<T>(fn: (pool: pg.Pool) => Promise<T>): Promise<T> {
+async function withFreshDatabase<T>(fn: (pool: pg.Pool, connectionString: string) => Promise<T>): Promise<T> {
   const admin = new Client({ connectionString: BASE_URL });
   await admin.connect();
   const database = `weave_i41_test_${process.pid}_${dbCounter++}_${randomBytes(3).toString("hex")}`;
@@ -39,10 +39,11 @@ async function withFreshDatabase<T>(fn: (pool: pg.Pool) => Promise<T>): Promise<
   } finally {
     await admin.end();
   }
-  const pool = createDatabasePool(createDatabaseConfig(swapDatabase(BASE_URL, database)));
+  const connectionString = swapDatabase(BASE_URL, database);
+  const pool = createDatabasePool(createDatabaseConfig(connectionString));
   try {
     await runMigrations(pool);
-    return await fn(pool);
+    return await fn(pool, connectionString);
   } finally {
     await pool.end();
     const dropper = new Client({ connectionString: BASE_URL });
@@ -384,5 +385,106 @@ test("no proof or body sentinel reaches the audit row", async () => {
     assert.ok(!blob.includes(proof.slice(0, 32)), "proof must not reach audit");
     assert.ok(!blob.includes(seed.devicePublicHex.slice(0, 32)), "device key must not reach audit");
     assert.ok(!blob.includes(fields.hostPublic.slice(0, 32)), "host key must not reach audit");
+  });
+});
+
+/** Wait until the given backend is blocked on a row lock. */
+async function awaitRowLock(pool: pg.Pool, pid: unknown): Promise<void> {
+  const deadline = Date.now() + 10000;
+  for (;;) {
+    const waiting = (
+      await pool.query(
+        `SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`,
+        [pid],
+      )
+    ).rows[0].n as number;
+    if (waiting === 1) return;
+    if (Date.now() > deadline) throw new Error("issue never reached the row lock");
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+test("device revoked during issue lock-wait refuses with no row/audit", async () => {
+  await withFreshDatabase(async (pool, connectionString) => {
+    const seed = await seedEligibleIssuer(pool, "lockwait-device");
+    const fields = freshFields(seed);
+    const proof = signIssuance(seed.deviceKey, fields);
+    // Single-client pool so the issue transaction's backend pid is known.
+    const issuePool = createDatabasePool(createDatabaseConfig(connectionString, 1));
+    try {
+      const pid = (await issuePool.query(`SELECT pg_backend_pid() AS pid`)).rows[0].pid;
+      const blocker = await pool.connect();
+      try {
+        await blocker.query("BEGIN");
+        await blocker.query(`SELECT 1 FROM credential WHERE id = $1 FOR UPDATE`, [seed.device]);
+        const attempt = issuePairingToken(issuePool, { ...fields, proof }, randomUUID());
+        await awaitRowLock(pool, pid);
+        await blocker.query(`UPDATE credential SET revoked_at = now() WHERE id = $1`, [seed.device]);
+        await blocker.query("COMMIT");
+        assert.deepEqual(await attempt, { ok: false });
+      } finally {
+        blocker.release();
+      }
+    } finally {
+      await issuePool.end();
+    }
+    assert.equal(await tokenCount(pool), 0);
+    assert.equal(await auditCount(pool), 0);
+  });
+});
+
+test("root revoked during issue lock-wait refuses with no row/audit", async () => {
+  await withFreshDatabase(async (pool, connectionString) => {
+    const seed = await seedEligibleIssuer(pool, "lockwait-root");
+    const fields = freshFields(seed);
+    const proof = signIssuance(seed.deviceKey, fields);
+    const issuePool = createDatabasePool(createDatabaseConfig(connectionString, 1));
+    try {
+      const pid = (await issuePool.query(`SELECT pg_backend_pid() AS pid`)).rows[0].pid;
+      const blocker = await pool.connect();
+      try {
+        await blocker.query("BEGIN");
+        await blocker.query(`SELECT 1 FROM credential WHERE id = $1 FOR UPDATE`, [seed.root]);
+        const attempt = issuePairingToken(issuePool, { ...fields, proof }, randomUUID());
+        await awaitRowLock(pool, pid);
+        await blocker.query(`UPDATE credential SET revoked_at = now() WHERE id = $1`, [seed.root]);
+        await blocker.query("COMMIT");
+        assert.deepEqual(await attempt, { ok: false });
+      } finally {
+        blocker.release();
+      }
+    } finally {
+      await issuePool.end();
+    }
+    assert.equal(await tokenCount(pool), 0);
+    assert.equal(await auditCount(pool), 0);
+  });
+});
+
+test("member revoked during issue lock-wait refuses with no row/audit", async () => {
+  await withFreshDatabase(async (pool, connectionString) => {
+    const seed = await seedEligibleIssuer(pool, "lockwait-member");
+    const fields = freshFields(seed);
+    const proof = signIssuance(seed.deviceKey, fields);
+    const issuePool = createDatabasePool(createDatabaseConfig(connectionString, 1));
+    try {
+      const pid = (await issuePool.query(`SELECT pg_backend_pid() AS pid`)).rows[0].pid;
+      const blocker = await pool.connect();
+      try {
+        await blocker.query("BEGIN");
+        await blocker.query(`SELECT 1 FROM member WHERE id = $1 FOR UPDATE`, [seed.member]);
+        const attempt = issuePairingToken(issuePool, { ...fields, proof }, randomUUID());
+        await awaitRowLock(pool, pid);
+        await blocker.query(`UPDATE member SET revoked_at = now() WHERE id = $1`, [seed.member]);
+        await blocker.query("COMMIT");
+        assert.deepEqual(await attempt, { ok: false });
+      } finally {
+        blocker.release();
+      }
+    } finally {
+      await issuePool.end();
+    }
+    assert.equal(await tokenCount(pool), 0);
+    assert.equal(await auditCount(pool), 0);
   });
 });

@@ -47,18 +47,6 @@ function parseMsText(value: string): bigint | null {
   return parsed;
 }
 
-export function parsePairingMs(value: unknown): bigint | null {
-  if (typeof value === "string") return parseMsText(value);
-  if (typeof value === "bigint") {
-    return value >= 0n && value <= ISSUE_MAX_MS ? value : null;
-  }
-  if (typeof value === "number") {
-    if (!Number.isInteger(value) || value < 0 || value > Number(ISSUE_MAX_MS)) return null;
-    return BigInt(value);
-  }
-  return null;
-}
-
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export async function issuePairingToken(
@@ -122,9 +110,14 @@ async function issueInTransaction(
     String(input.device) < rootId
       ? [String(input.device), rootId]
       : [rootId, String(input.device)];
+  // Deterministic ascending-UUID lock order: two separate ordered row locks,
+  // mirroring the 0007 backstop. A single `WHERE id = $1 OR id = $2` query
+  // must not be used — parameter order does not govern lock acquisition.
+  await client.query(`SELECT 1 FROM credential WHERE id = $1 FOR UPDATE`, [firstId]);
+  await client.query(`SELECT 1 FROM credential WHERE id = $1 FOR UPDATE`, [secondId]);
   const lockedCreds = await client.query(
     `SELECT id, person_id, public_key, kind, algorithm, parent_credential_id, revoked_at
-     FROM credential WHERE id = $1 OR id = $2 FOR UPDATE`,
+     FROM credential WHERE id = $1 OR id = $2`,
     [firstId, secondId],
   );
   if (lockedCreds.rows.length !== 2) return refuse();
