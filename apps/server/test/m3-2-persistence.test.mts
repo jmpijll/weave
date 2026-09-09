@@ -510,6 +510,14 @@ test("post-lock revalidation refuses an issuer revoked mid-issue", async () => {
          VALUES ($1, $2, $3, '4000', 1, '604000')`,
         [device, "f0".repeat(32), community],
       );
+      // Attach the rejection handler synchronously when creating the query:
+      // a fast post-release rejection must never sit unhandled while the
+      // poll loop observes the lock wait (Node reports
+      // PromiseRejectionHandledWarning and fails the run).
+      const refused = assert.rejects(attempt, (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return message.includes("revoked under lock");
+      });
       // Wait until the issue is blocked on the row lock.
       const deadline = Date.now() + 10000;
       for (;;) {
@@ -526,10 +534,7 @@ test("post-lock revalidation refuses an issuer revoked mid-issue", async () => {
       await blocker.query(`UPDATE credential SET revoked_at = now() WHERE id = $1`, [device]);
       await blocker.query("COMMIT");
 
-      await assert.rejects(attempt, (error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        return message.includes("revoked under lock");
-      });
+      await refused;
       const count = (await pool.query(`SELECT count(*)::int AS n FROM pairing_token`)).rows[0].n;
       assert.equal(count, 0, "mid-issue revocation must land no row");
     } finally {
