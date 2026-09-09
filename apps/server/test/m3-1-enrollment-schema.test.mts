@@ -67,8 +67,10 @@ async function expectReject(
   }
 }
 
-/** Seed a community, a person, a human-owner root credential, and a valid
- * (kind=host, parented to the human root) host credential. Returns their ids. */
+/** Seed a community, a person, a human-owner root credential, an eligible
+ * human device under that root with an active human membership, and a valid
+ * (kind=host, parented to the human root) host credential. Returns their ids.
+ * Pairing inserts must use the device (never the root) as issuer. */
 async function seedScope(pool: pg.Pool) {
   const community = (await pool.query(
     `INSERT INTO community (canonical_tls_origin, name) VALUES ($1, $2) RETURNING id`,
@@ -83,18 +85,28 @@ async function seedScope(pool: pg.Pool) {
      VALUES ($1, $2, $3, 'human') RETURNING id`,
     [person, "0".repeat(64), "ed25519"],
   )).rows[0].id;
+  const device = (await pool.query(
+    `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
+     VALUES ($1, $2, $3, 'human', $4) RETURNING id`,
+    [person, "f".repeat(64), "ed25519", credential],
+  )).rows[0].id;
+  await pool.query(
+    `INSERT INTO member (community_id, subject_kind, person_id)
+     VALUES ($1, 'human', $2)`,
+    [community, person],
+  );
   const hostCredential = (await pool.query(
     `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
      VALUES ($1, $2, $3, 'host', $4) RETURNING id`,
     [person, "1".repeat(64), "ed25519", credential],
   )).rows[0].id;
-  return { community, person, credential, hostCredential };
+  return { community, person, credential, device, hostCredential };
 }
 
 test("fresh database applies 0005 once; re-run applies nothing", async () => {
   await withFreshDatabase(async (pool) => {
     const first = await runMigrations(pool);
-    assert.deepEqual(first.applied, [1, 2, 3, 4, 5, 6]);
+    assert.deepEqual(first.applied, [1, 2, 3, 4, 5, 6, 7]);
     assert.equal(first.skipped, 0);
 
     const tables = await pool.query(
@@ -122,13 +134,14 @@ test("fresh database applies 0005 once; re-run applies nothing", async () => {
       "recovery_verifier",
       "recovery_challenge",
       "pairing_token",
+      "pairing_policy_registry",
     ]) {
       assert.ok(names.includes(expected), `expected table ${expected} to exist`);
     }
 
     const second = await runMigrations(pool);
     assert.deepEqual(second.applied, []);
-    assert.equal(second.skipped, 6);
+    assert.equal(second.skipped, 7);
   });
 });
 
@@ -164,19 +177,21 @@ test("pairing_token exposes the frozen column set with correct types and default
     const map: Record<string, { data_type: string; is_nullable: string; column_default: string | null }> = {};
     for (const row of columns) map[row.column_name] = row;
 
-    // Exactly the frozen contract §2 column set — no extras such as issued_at.
+    // Exactly the I2 column set: the M3.1 six plus issued_at/policy_version.
     const cols = columns.map((r) => r.column_name);
     for (const expected of [
       "id",
       "issued_by_credential_id",
       "host_public_key",
       "community_id",
+      "issued_at",
+      "policy_version",
       "expires_at",
       "consumed_at",
     ]) {
       assert.ok(cols.includes(expected), `pairing_token must carry ${expected}`);
     }
-    assert.equal(cols.length, 6, "pairing_token must have exactly the six frozen columns");
+    assert.equal(cols.length, 8, "pairing_token must have exactly the eight I2 columns");
 
     assert.equal(map.id.data_type, "uuid");
     assert.equal(map.id.is_nullable, "NO");
@@ -184,8 +199,10 @@ test("pairing_token exposes the frozen column set with correct types and default
     assert.equal(map.issued_by_credential_id.data_type, "uuid");
     assert.equal(map.host_public_key.data_type, "text");
     assert.equal(map.community_id.data_type, "uuid");
-    assert.equal(map.expires_at.data_type, "timestamp with time zone");
-    assert.equal(map.consumed_at.data_type, "timestamp with time zone");
+    assert.equal(map.issued_at.data_type, "bigint");
+    assert.equal(map.policy_version.data_type, "integer");
+    assert.equal(map.expires_at.data_type, "bigint");
+    assert.equal(map.consumed_at.data_type, "bigint");
     assert.equal(map.consumed_at.is_nullable, "YES");
   });
 });
@@ -193,59 +210,74 @@ test("pairing_token exposes the frozen column set with correct types and default
 test("pairing_token enforces references and the strict 64-char lowercase-hex host key", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
-    const { community, credential } = await seedScope(pool);
+    const { community, device } = await seedScope(pool);
     const base = {
       insert: `INSERT INTO pairing_token
-         (issued_by_credential_id, host_public_key, community_id, expires_at)
-       VALUES ($1, $2, $3, now() + interval '1 hour')`,
+         (issued_by_credential_id, host_public_key, community_id, issued_at, policy_version, expires_at)
+       VALUES ($1, $2, $3, '8000', 1, '608000')`,
     };
 
-    // A valid lowercase 64-char hex host key inserts.
-    await pool.query(base.insert, [credential, "aa".repeat(32), community]);
+    // A valid lowercase 64-char hex host key inserts (device issuer, exact times).
+    await pool.query(base.insert, [device, "aa".repeat(32), community]);
 
     // Uppercase hex is refused (strict lowercase floor).
-    await expectReject(pool, base.insert, [credential, "AA".repeat(32), community], "pairing_token_host_public_key_lower_hex");
+    await expectReject(pool, base.insert, [device, "AA".repeat(32), community], "pairing_token_host_public_key_lower_hex");
     // Non-hex characters are refused.
-    await expectReject(pool, base.insert, [credential, "z".repeat(64), community], "pairing_token_host_public_key_lower_hex");
+    await expectReject(pool, base.insert, [device, "z".repeat(64), community], "pairing_token_host_public_key_lower_hex");
     // Wrong length (63 hex chars) is refused.
-    await expectReject(pool, base.insert, [credential, "a".repeat(63), community], "pairing_token_host_public_key_lower_hex");
+    await expectReject(pool, base.insert, [device, "a".repeat(63), community], "pairing_token_host_public_key_lower_hex");
     // Wrong length (65 hex chars) is refused.
-    await expectReject(pool, base.insert, [credential, "a".repeat(65), community], "pairing_token_host_public_key_lower_hex");
+    await expectReject(pool, base.insert, [device, "a".repeat(65), community], "pairing_token_host_public_key_lower_hex");
 
     // issued_by_credential_id FK is enforced (a non-existent credential refuses).
     await expectReject(
       pool,
       base.insert,
       ["00000000-0000-4000-8000-0000000000fe", "ab".repeat(32), community],
-      "foreign key",
+      "issuer",
     );
-    // community_id FK is enforced (a non-existent community refuses).
+    // community_id FK is enforced (a non-existent community refuses). The
+    // issuer trigger fires before the FK check, so the refusal surfaces
+    // there; the FK itself is proven in the catalog below.
     await expectReject(
       pool,
       base.insert,
-      [credential, "ab".repeat(32), "00000000-0000-4000-8000-0000000000ed"],
-      "foreign key",
+      [device, "ab".repeat(32), "00000000-0000-4000-8000-0000000000ed"],
+      "no active human membership",
     );
+    const fks = (await pool.query(
+      `SELECT kcu.column_name, ccu.table_name AS ref_table
+       FROM information_schema.table_constraints tc
+       JOIN information_schema.key_column_usage kcu
+         ON tc.constraint_name = kcu.constraint_name
+       JOIN information_schema.constraint_column_usage ccu
+         ON tc.constraint_name = ccu.constraint_name
+       WHERE tc.table_name = 'pairing_token' AND tc.constraint_type = 'FOREIGN KEY'`,
+    )).rows;
+    const fkCols = fks.map((r) => `${r.column_name}->${r.ref_table}`);
+    assert.ok(fkCols.includes("community_id->community"), "community_id must FK to community");
+    assert.ok(fkCols.includes("issued_by_credential_id->credential"), "issuer must FK to credential");
+    assert.ok(fkCols.includes("policy_version->pairing_policy_registry"), "policy must FK to the registry");
   });
 });
 
 test("consumed_at is nullable and a consumed token is a state, not a deletion", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
-    const { community, credential } = await seedScope(pool);
+    const { community, device } = await seedScope(pool);
     const token = (await pool.query(
       `INSERT INTO pairing_token
-         (issued_by_credential_id, host_public_key, community_id, expires_at)
-       VALUES ($1, $2, $3, now() + interval '1 hour') RETURNING id, consumed_at`,
-      [credential, "aa".repeat(32), community],
+         (issued_by_credential_id, host_public_key, community_id, issued_at, policy_version, expires_at)
+       VALUES ($1, $2, $3, '9000', 1, '609000') RETURNING id, consumed_at`,
+      [device, "aa".repeat(32), community],
     )).rows[0];
     assert.equal(token.consumed_at, null, "a pending token has NULL consumed_at");
 
     const updated = await pool.query(
-      `UPDATE pairing_token SET consumed_at = now() WHERE id = $1 RETURNING consumed_at`,
+      `UPDATE pairing_token SET consumed_at = '609000' WHERE id = $1 RETURNING consumed_at`,
       [token.id],
     );
-    assert.ok(updated.rows[0].consumed_at, "consumed_at becomes set on consume");
+    assert.equal(String(updated.rows[0].consumed_at), "609000", "consumed_at becomes set on consume");
     const count = (await pool.query(`SELECT count(*)::int AS n FROM pairing_token`)).rows[0].n;
     assert.equal(count, 1, "consume must not delete the row");
   });
