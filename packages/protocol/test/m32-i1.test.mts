@@ -826,3 +826,20 @@ test("X-03 HOST via issuance parser rejects", ()=>{ assert.throws(()=>parseIssua
 test("X-04 HOST via consume parser rejects", ()=>{ assert.throws(()=>parseConsumeRecord(new Uint8Array(ORACLE_HOST))); });
 test("X-05 CONSUME via issuance parser rejects", ()=>{ assert.throws(()=>parseIssuanceRecord(new Uint8Array(ORACLE_CONSUME))); });
 test("X-06 CONSUME via host parser rejects", ()=>{ assert.throws(()=>parseHostPossessionRecord(new Uint8Array(ORACLE_CONSUME))); });
+
+// I1.1 portability: shared m32 record layer must build/parse without Node global Buffer
+test("PORTABILITY m32 records build and parse with globalThis.Buffer unavailable", ()=>{
+  const g = globalThis as unknown as Record<string, unknown>;
+  const saved = g.Buffer;
+  g.Buffer = undefined;
+  try {
+    const issFields = { stableId:"00112233-4455-6677-8899-aabbccddeeff", hostPublic:"a".repeat(64), community:"11111111-2222-3333-4444-555555555555", device:"22222222-3333-4444-5555-666666666666", issuedAt:"123456" };
+    assert.deepEqual(parseIssuanceRecord(buildIssuanceRecord(issFields)), issFields);
+    const hostFields = { stableId:"00112233-4455-6677-8899-aabbccddeeff", hostPublic:"b".repeat(64), issuedAt:"123457" };
+    assert.deepEqual(parseHostPossessionRecord(buildHostPossessionRecord(hostFields)), hostFields);
+    const consFields = { stableId:"00112233-4455-6677-8899-aabbccddeeff", hostPublic:"c".repeat(64), community:"11111111-2222-3333-4444-555555555555", device:"22222222-3333-4444-5555-666666666666", issuedAt:"123458", consumeFreshness:"123459" };
+    assert.deepEqual(parseConsumeRecord(buildConsumeRecord(consFields)), consFields);
+  } finally {
+    g.Buffer = saved;
+  }
+});
