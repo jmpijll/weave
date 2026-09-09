@@ -8,6 +8,11 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./m32-verify": {
+      "types": "./src/m32-verify.ts",
+      "import": "./src/m32-verify.ts",
+      "default": "./src/m32-verify.ts"
     }
   },
   "files": [
