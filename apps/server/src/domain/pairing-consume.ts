@@ -30,7 +30,7 @@ import { verifyConsume, verifyHostPossession } from "@weave/protocol/m32-verify"
 import { writeAuditEvent, AUDIT_EVENT } from "../db/audit.ts";
 import { withTransaction } from "../db/transaction.ts";
 
-export const CONSUME_FRESHNESS_MS = 120_000n;
+export const CONSUME_FRESHNESS_MS = 300_000n;
 export const CONSUME_FUTURE_SKEW_MS = 30_000n;
 export const CONSUME_MAX_MS = 9_007_199_254_740_991n;
 export const CONSUME_POLICY_VERSION = 1;

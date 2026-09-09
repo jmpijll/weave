@@ -271,6 +271,26 @@ test("concurrent competing consumes yield exactly one winner", async () => {
   });
 });
 
+test("owner consume freshness window is five minutes: 3.5-minute-old proof succeeds, over-5-minute proof refuses pending", async () => {
+  await withFreshDatabase(async (pool) => {
+    const setup = await issueToken(pool, "freshwindow");
+    // Strictly over 2 minutes but within 5: correctly signed and
+    // binding-matched, must succeed.
+    const inWindow = validConsumeInput(setup, { consumeFreshness: String(Date.now() - 210_000) });
+    assert.deepEqual(await consumePairingToken(pool, inWindow, randomUUID()), { ok: true });
+    assert.deepEqual(await artifactCounts(pool, setup.stableId), { hostCreds: 1, hosts: 1, audits: 1 });
+  });
+  await withFreshDatabase(async (pool) => {
+    const setup = await issueToken(pool, "freshwindow-old");
+    // Over 5 minutes: correctly signed and binding-matched, must collapse
+    // with the token left pending and no artifacts.
+    const stale = validConsumeInput(setup, { consumeFreshness: String(Date.now() - 500_000) });
+    assert.deepEqual(await consumePairingToken(pool, stale, randomUUID()), { ok: false });
+    assert.equal(await tokenState(pool, setup.stableId), null);
+    assert.deepEqual(await artifactCounts(pool, setup.stableId), { hostCreds: 0, hosts: 0, audits: 0 });
+  });
+});
+
 test("every immutable binding swap refuses with token pending", async () => {
   await withFreshDatabase(async (pool) => {
     const setup = await issueToken(pool, "swaps");
