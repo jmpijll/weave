@@ -1,5 +1,10 @@
 /** The protocol package is the compile-time contract shared by all programs. */
 export * from "./recovery/index.ts";
+export * from "./m32/issuance.ts";
+export * from "./m32/host-possession.ts";
+export * from "./m32/consume.ts";
+export * from "./m32/proofs.ts";
+export * from "./m32/carrier.ts";
 
 export const PROTOCOL_NAME = "weave" as const;
 export const PROTOCOL_VERSION = 1 as const;
