@@ -19,6 +19,7 @@ export const AUDIT_EVENT = {
   spaceInviteRevoked: "space.invite.revoked",
   spaceInviteExpired: "space.invite.expired",
   pairingTokenIssued: "pairing.token.issued",
+  hostEnrolled: "host.enrolled",
 } as const;
 
 export type AuditEventType = (typeof AUDIT_EVENT)[keyof typeof AUDIT_EVENT];

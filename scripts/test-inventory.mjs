@@ -68,6 +68,14 @@
   *                                      POST /v1/pairing-tokens HTTP: response
   *                                      table, duplicate-key guard, redaction
   *                                      (node:test; needs DATABASE_URL)
+  *  19. m3-2-pairing-consume.test.mts  M3.2-I4.2 locked token consume / host
+  *                                      enroll transaction, binding/proof
+  *                                      matrix, races, rollback cardinality
+  *                                      (node:test; needs DATABASE_URL)
+  *  20. m3-2-http-enroll.test.mts      M3.2-I4.2 POST /v1/hosts/enroll HTTP:
+  *                                      P1 400 vs collapsed 404, accepted 200,
+  *                                      redaction (node:test; needs
+  *                                      DATABASE_URL)
  *
  * Each layer runs as its own child process with the pinned `node` binary
  * (process.execPath), so a failure is isolated and attributable. A non-zero
@@ -98,6 +106,8 @@ const INVENTORY = [
   { name: "m3-2-persistence.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-persistence.test.mts"] },
   { name: "m3-2-pairing-issue.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-pairing-issue.test.mts"] },
   { name: "m3-2-http-json.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-http-json.test.mts"] },
+  { name: "m3-2-pairing-consume.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-pairing-consume.test.mts"] },
+  { name: "m3-2-http-enroll.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-http-enroll.test.mts"] },
 ];
 
 let failed = 0;
