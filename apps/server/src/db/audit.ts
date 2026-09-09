@@ -18,6 +18,7 @@ export const AUDIT_EVENT = {
   spaceInviteAccepted: "space.invite.accepted",
   spaceInviteRevoked: "space.invite.revoked",
   spaceInviteExpired: "space.invite.expired",
+  pairingTokenIssued: "pairing.token.issued",
 } as const;
 
 export type AuditEventType = (typeof AUDIT_EVENT)[keyof typeof AUDIT_EVENT];

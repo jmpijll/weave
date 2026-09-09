@@ -63,6 +63,7 @@ import {
 } from "@weave/protocol";
 import type { RecoveryErrorCode, RecoveryVerifyRequest } from "@weave/protocol";
 import type { V1BoundaryController } from "./boundary.ts";
+import { readBoundedBody } from "./json-body.ts";
 
 /** The minimal database surface this route needs: parameterized reads only. */
 export type Queryable = {
@@ -348,8 +349,6 @@ export interface RecoveryVerifyContext {
   boundary: V1BoundaryController;
 }
 
-type RawBody = Buffer | "oversize" | "timeout" | "aborted";
-
 /** Wire the route into a `node:http` request/response pair. */
 export async function handleRecoveryVerify(
   request: IncomingMessage,
@@ -379,7 +378,7 @@ export async function handleRecoveryVerify(
       return;
     }
 
-    const raw = await readBody(request, MAX_BODY_BYTES, operation.admission.bodyDeadlineMs);
+    const raw = await readBoundedBody(request, MAX_BODY_BYTES, operation.admission.bodyDeadlineMs);
     if (raw === "oversize") {
       operation.dropAfterFlush();
       writeRecoveryEnvelope(operation, "bad_request");
@@ -419,43 +418,10 @@ export async function handleRecoveryVerify(
 }
 
 /** Read a bounded raw body, distinguishing deadline expiry from client abort. */
+type RawBody = Buffer | "oversize" | "timeout" | "aborted";
+
 function readBody(request: IncomingMessage, max: number, deadlineMs: number): Promise<RawBody> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const cleanup = () => {
-      if (timer) clearTimeout(timer);
-      request.removeListener("data", onData);
-      request.removeListener("end", onEnd);
-      request.removeListener("error", onError);
-      request.removeListener("aborted", onAborted);
-    };
-    const finish = (value: RawBody): void => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(value);
-    };
-    const onData = (chunk: Buffer | string): void => {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
-      total += buffer.length;
-      if (total > max) {
-        finish("oversize");
-        return;
-      }
-      chunks.push(buffer);
-    };
-    const onEnd = (): void => finish(Buffer.concat(chunks));
-    const onError = (): void => finish("aborted");
-    const onAborted = (): void => finish("aborted");
-    timer = setTimeout(() => finish("timeout"), deadlineMs);
-    request.on("data", onData);
-    request.on("end", onEnd);
-    request.on("error", onError);
-    request.on("aborted", onAborted);
-  });
+  return readBoundedBody(request, max, deadlineMs);
 }
 
 /** Generic S8 `not_found` envelope for an unknown `/v1/*` path (ADR §M1.3.2). */
