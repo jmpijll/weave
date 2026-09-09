@@ -60,6 +60,14 @@
   *                                      facts, one-way consume, delete
   *                                      refusal (node:test; needs
   *                                      DATABASE_URL)
+  *  17. m3-2-pairing-issue.test.mts    M3.2-I4.1 proof-gated token issuance:
+  *                                      locked issue/retry transaction, issuer
+  *                                      matrix, races, audit cardinality
+  *                                      (node:test; needs DATABASE_URL)
+  *  18. m3-2-http-json.test.mts        M3.2-I4.1 shared strict JSON helper +
+  *                                      POST /v1/pairing-tokens HTTP: response
+  *                                      table, duplicate-key guard, redaction
+  *                                      (node:test; needs DATABASE_URL)
  *
  * Each layer runs as its own child process with the pinned `node` binary
  * (process.execPath), so a failure is isolated and attributable. A non-zero
@@ -88,6 +96,8 @@ const INVENTORY = [
   { name: "m2-2a-covering-set.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m2-2a-covering-set.test.mts"] },
   { name: "m32-i1-pure-protocol.test.mts", args: ["--experimental-strip-types", "--test", "packages/protocol/test/m32-i1.test.mts"] },
   { name: "m3-2-persistence.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-persistence.test.mts"] },
+  { name: "m3-2-pairing-issue.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-pairing-issue.test.mts"] },
+  { name: "m3-2-http-json.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-http-json.test.mts"] },
 ];
 
 let failed = 0;

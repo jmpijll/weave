@@ -7,6 +7,7 @@ import { createDatabaseConfig, createDatabasePool, databaseUrlFromEnv } from "./
 import { runMigrations } from "./db/migrate.ts";
 import { logEvent } from "./log.ts";
 import { handleRecoveryVerify, sendRecoveryV1Unknown } from "./http/recovery-verify.ts";
+import { handlePairingIssue } from "./http/pairing-issue.ts";
 import { createV1Boundary } from "./http/boundary.ts";
 import type { AdmissionConfig, OutcomeLogger, V1Operation } from "./http/boundary.ts";
 
@@ -79,6 +80,10 @@ export function createWeaveServer(options: ServerOptions = {}): Server {
     if (url.startsWith("/v1/")) {
       if (url === "/v1/identity/recovery/verify") {
         void handleRecoveryVerify(request, response, { db: options.pool, ready: readiness, boundary });
+        return;
+      }
+      if (url === "/v1/pairing-tokens") {
+        void handlePairingIssue(request, response, { db: options.pool, ready: readiness, boundary });
         return;
       }
       const testOperation = options.testOnlyV1Operations?.get(url);
