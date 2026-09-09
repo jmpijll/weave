@@ -3,6 +3,8 @@ export const ISSUANCE_PURPOSE = "weave-issue-v1";
  * validated through the issuance parser) inhabit this type, so a host or
  * consume record cannot be passed to the issuance verifier at compile time. */
 export type IssuanceRecord = Uint8Array & { readonly __weaveRecordPurpose: "issuance" };
+const UTF8_ENC = new TextEncoder();
+const UTF8_DEC = new TextDecoder("utf-8", { fatal: true });
 function assertBigIntMs(s: string) {
   if (!/^(0|[1-9][0-9]{0,15})$/.test(s)) throw new Error("bad BigInt grammar");
   const bi = BigInt(s);
@@ -17,7 +19,7 @@ export function buildIssuanceRecord(fields: IssuanceFields): IssuanceRecord {
   assertBigIntMs(fields.issuedAt); assertHostPublic(fields.hostPublic);
   const parts: Uint8Array[] = [];
   const add = (tag: number, value: string) => {
-    const v = Buffer.from(value, "utf8");
+    const v = UTF8_ENC.encode(value);
     if (v.length > 255) throw new Error("too long");
     parts.push(new Uint8Array([tag, v.length, ...v]));
   };
@@ -51,7 +53,7 @@ export function parseIssuanceRecord(buf: Uint8Array): IssuanceFields {
     const idx=ORDER.indexOf(tag);
     if(idx<=lastIdx) throw new Error("out-of-order");
     if(i+2+len>buf.length) throw new Error("invalid length");
-    const v=Buffer.from(buf.slice(i+2,i+2+len)).toString("utf8");
+    const v=UTF8_DEC.decode(buf.slice(i+2,i+2+len));
     vals.set(tag,v); seen.add(tag); lastIdx=idx; i+=2+len;
   }
   if(i!==buf.length) throw new Error("trailing");
