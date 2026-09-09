@@ -294,7 +294,7 @@ test("boundary issue at max succeeds; first overflow and mismatched expiry fail"
     await expectReject(pool, mismatch.insert, mismatch.params(device, community), "expires_at");
 
     const negative = insertToken("-1", "599999");
-    await expectReject(pool, negative.insert, negative.params(device, community), "issued_at");
+    await expectReject(pool, negative.insert, negative.params(device, community), "is not an exact millisecond");
 
     await expectReject(pool,
       `INSERT INTO pairing_token
@@ -302,6 +302,8 @@ test("boundary issue at max succeeds; first overflow and mismatched expiry fail"
        VALUES ($1, $2, $3, $4, 2, $5)`,
       [device, "aa".repeat(32), community, "123456", "723456"],
       "policy");
+    const boundaryCount = (await pool.query(`SELECT count(*)::int AS n FROM pairing_token`)).rows[0].n;
+    assert.equal(boundaryCount, 1, "only the max-boundary row lands; every refusal lands nothing");
   });
 });
 

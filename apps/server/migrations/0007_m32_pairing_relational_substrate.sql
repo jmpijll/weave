@@ -122,6 +122,11 @@ BEGIN
     RAISE EXCEPTION 'pairing issue refused: new token must not carry consumed_at';
   END IF;
 
+  -- Exact-ms range guard before any arithmetic: the scalar constraints stay
+  -- as defense in depth, but the trigger owns range validation first.
+  IF NEW.issued_at IS NULL OR NEW.issued_at < 0 OR NEW.issued_at > 9007199254740991 THEN
+    RAISE EXCEPTION 'pairing issue refused: issued_at is not an exact millisecond in 0..9007199254740991';
+  END IF;
   -- Overflow is checked before arithmetic: bigint addition raises, never wraps.
   IF NEW.issued_at > 9007199254740991 - policy_duration THEN
     RAISE EXCEPTION 'pairing issue refused: issued_at % overflows with duration %', NEW.issued_at, policy_duration;
