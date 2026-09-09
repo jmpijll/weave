@@ -111,9 +111,15 @@ DECLARE
   member_row RECORD;
 BEGIN
   SELECT duration_ms INTO policy_duration
-    FROM pairing_policy_registry WHERE version = NEW.policy_version FOR UPDATE;
+    FROM pairing_policy_registry WHERE version = NEW.policy_version FOR SHARE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'pairing issue refused: unknown policy version % (only version 1 exists)', NEW.policy_version;
+  END IF;
+
+  -- A new pairing row must begin pending; the only persisted transition to a
+  -- consumed value is I4's later NULL -> valid bigint update.
+  IF NEW.consumed_at IS NOT NULL THEN
+    RAISE EXCEPTION 'pairing issue refused: new token must not carry consumed_at';
   END IF;
 
   -- Overflow is checked before arithmetic: bigint addition raises, never wraps.
@@ -216,7 +222,10 @@ CREATE TRIGGER enforce_pairing_token_update
   FOR EACH ROW EXECUTE FUNCTION enforce_pairing_token_update();
 
 -- ---------------------------------------------------------------------------
--- Token rows are never deleted.
+-- Token and policy rows are never deleted or truncated. TRUNCATE needs its
+-- own statement-level refusal: it fires no row trigger and can traverse the
+-- FK in multi-table form. A dedicated function (never the row-mutation path,
+-- which reads OLD) keeps the failure explicit.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION refuse_pairing_token_delete() RETURNS trigger AS $$
 BEGIN
@@ -227,3 +236,17 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER refuse_pairing_token_delete
   BEFORE DELETE ON pairing_token
   FOR EACH ROW EXECUTE FUNCTION refuse_pairing_token_delete();
+
+CREATE OR REPLACE FUNCTION refuse_pairing_truncate() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'pairing lifecycle tables may not be truncated';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER refuse_pairing_token_truncate
+  BEFORE TRUNCATE ON pairing_token
+  FOR EACH STATEMENT EXECUTE FUNCTION refuse_pairing_truncate();
+
+CREATE TRIGGER refuse_pairing_policy_truncate
+  BEFORE TRUNCATE ON pairing_policy_registry
+  FOR EACH STATEMENT EXECUTE FUNCTION refuse_pairing_truncate();

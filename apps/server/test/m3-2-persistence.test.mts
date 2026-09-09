@@ -75,8 +75,12 @@ async function expectReject(
 const MIGRATIONS_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
 
 /** Seed community + person + unrevoked human root + unrevoked human device +
- * active human membership. Returns ids. */
+ * active human membership. Returns ids. Credential keys derive from the tag
+ * so independent seeds never collide on the identity unique constraint. */
 async function seedEligibleIssuer(pool: pg.Pool, tag: string) {
+  const { createHash } = await import("node:crypto");
+  const rootKey = createHash("sha256").update(`root:${tag}`).digest("hex");
+  const deviceKey = createHash("sha256").update(`device:${tag}`).digest("hex");
   const community = (await pool.query(
     `INSERT INTO community (canonical_tls_origin, name) VALUES ($1, $2) RETURNING id`,
     [`https://${tag}.example`, "M3.2 Test"],
@@ -88,12 +92,12 @@ async function seedEligibleIssuer(pool: pg.Pool, tag: string) {
   const root = (await pool.query(
     `INSERT INTO credential (person_id, public_key, algorithm, kind)
      VALUES ($1, $2, 'ed25519', 'human') RETURNING id`,
-    [person, "0".repeat(64)],
+    [person, rootKey],
   )).rows[0].id;
   const device = (await pool.query(
     `INSERT INTO credential (person_id, public_key, algorithm, kind, parent_credential_id)
      VALUES ($1, $2, 'ed25519', 'human', $3) RETURNING id`,
-    [person, "1".repeat(64), root],
+    [person, deviceKey, root],
   )).rows[0].id;
   const member = (await pool.query(
     `INSERT INTO member (community_id, subject_kind, person_id)
@@ -238,6 +242,25 @@ test("nonempty pairing_token table fails the 0007 migration closed", async () =>
       `SELECT version FROM public.schema_migration ORDER BY version`,
     )).rows.map((r) => r.version);
     assert.deepEqual(versions, [1, 2, 3, 4, 5, 6], "failed 0007 must record nothing");
+
+    // The failed migration rolled back its DDL: legacy timestamp types remain
+    // and no policy registry or I2 trigger survives.
+    const expiresType = (await pool.query(
+      `SELECT data_type FROM information_schema.columns
+       WHERE table_name = 'pairing_token' AND column_name = 'expires_at'`,
+    )).rows[0].data_type;
+    assert.equal(expiresType, "timestamp with time zone", "failed 0007 must leave legacy expires_at");
+    const registry = (await pool.query(
+      `SELECT count(*)::int AS n FROM information_schema.tables
+       WHERE table_name = 'pairing_policy_registry'`,
+    )).rows[0].n;
+    assert.equal(registry, 0, "failed 0007 must leave no policy registry");
+    const triggers = (await pool.query(
+      `SELECT trigger_name FROM information_schema.triggers
+       WHERE trigger_name IN ('enforce_pairing_token_insert', 'refuse_pairing_policy_mutation',
+                              'refuse_pairing_token_truncate', 'refuse_pairing_policy_truncate')`,
+    )).rows;
+    assert.equal(triggers.length, 0, "failed 0007 must leave no I2 triggers");
   });
 });
 
@@ -378,6 +401,87 @@ test("only the eligible human device issues: full E1 matrix fails closed", async
   });
 });
 
+test("insert carrying consumed_at is refused and lands no row", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { community, device } = await seedEligibleIssuer(pool, "pending");
+    await expectReject(pool,
+      `INSERT INTO pairing_token
+         (issued_by_credential_id, host_public_key, community_id, issued_at, policy_version, expires_at, consumed_at)
+       VALUES ($1, $2, $3, '1000', 1, '601000', '601000')`,
+      [device, "dd".repeat(32), community],
+      "must not carry consumed_at");
+    const count = (await pool.query(`SELECT count(*)::int AS n FROM pairing_token`)).rows[0].n;
+    assert.equal(count, 0, "refused insert must land no row");
+  });
+});
+
+test("TRUNCATE is refused on pairing_token and the policy registry", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { community, device } = await seedEligibleIssuer(pool, "notrunc");
+    const { insert, params } = insertToken("2000", "602000");
+    await pool.query(insert, params(device, community));
+
+    await expectReject(pool, `TRUNCATE pairing_token`, [], "may not be truncated");
+    // Single-table registry TRUNCATE is refused by PostgreSQL's own
+    // referenced-FK guard before the statement trigger; the row still
+    // survives. The registry trigger itself is proven by the multi-table
+    // form below (where the FK check passes) and the catalog assertion.
+    await expectReject(pool, `TRUNCATE pairing_policy_registry`, [], "truncat");
+    // Multi-table form traverses the FK; the statement trigger still refuses.
+    await expectReject(pool,
+      `TRUNCATE pairing_token, pairing_policy_registry`, [], "may not be truncated");
+    const triggerRows = (await pool.query(
+      `SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgname LIKE 'refuse_pairing%'`,
+    )).rows.map((r) => r.tgname);
+    assert.ok(triggerRows.includes("refuse_pairing_token_truncate"), "token TRUNCATE trigger must exist");
+    assert.ok(triggerRows.includes("refuse_pairing_policy_truncate"), "policy TRUNCATE trigger must exist");
+
+    const tokens = (await pool.query(`SELECT count(*)::int AS n FROM pairing_token`)).rows[0].n;
+    assert.equal(tokens, 1, "lifecycle row must survive TRUNCATE attempts");
+    const policies = (await pool.query(`SELECT count(*)::int AS n FROM pairing_policy_registry`)).rows[0].n;
+    assert.equal(policies, 1, "policy seed must survive TRUNCATE attempts");
+  });
+});
+
+test("independent issuers do not serialize on the immutable policy row", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const first = await seedEligibleIssuer(pool, "conc-a");
+    const second = await seedEligibleIssuer(pool, "conc-b");
+
+    const a = await pool.connect();
+    const b = await pool.connect();
+    try {
+      await a.query("BEGIN");
+      await a.query(
+        `INSERT INTO pairing_token
+           (issued_by_credential_id, host_public_key, community_id, issued_at, policy_version, expires_at)
+         VALUES ($1, $2, $3, '3000', 1, '603000')`,
+        [first.device, "ee".repeat(32), first.community],
+      );
+
+      // A short lock timeout turns any policy-row serialization into a failure.
+      await b.query("BEGIN");
+      await b.query("SET LOCAL lock_timeout = '2s'");
+      await b.query(
+        `INSERT INTO pairing_token
+           (issued_by_credential_id, host_public_key, community_id, issued_at, policy_version, expires_at)
+         VALUES ($1, $2, $3, '3001', 1, '603001')`,
+        [second.device, "ef".repeat(32), second.community],
+      );
+      await b.query("COMMIT");
+      await a.query("COMMIT");
+
+      const count = (await pool.query(`SELECT count(*)::int AS n FROM pairing_token`)).rows[0].n;
+      assert.equal(count, 2, "both independent issues must land");
+    } finally {
+      a.release();
+      b.release();
+    }
+  });
+});
 test("issued facts are immutable; consume is one-way; delete is refused", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);
