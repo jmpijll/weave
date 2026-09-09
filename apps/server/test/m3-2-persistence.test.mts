@@ -432,6 +432,11 @@ test("TRUNCATE is refused on pairing_token and the policy registry", async () =>
     // Multi-table form traverses the FK; the statement trigger still refuses.
     await expectReject(pool,
       `TRUNCATE pairing_token, pairing_policy_registry`, [], "may not be truncated");
+    // Registry-first order demonstrates the registry statement trigger
+    // itself: the intentional truncation error, never an OLD-record path
+    // (TRUNCATE fires no row trigger at all).
+    await expectReject(pool,
+      `TRUNCATE pairing_policy_registry, pairing_token`, [], "may not be truncated");
     const triggerRows = (await pool.query(
       `SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgname LIKE 'refuse_pairing%'`,
     )).rows.map((r) => r.tgname);
@@ -482,6 +487,56 @@ test("independent issuers do not serialize on the immutable policy row", async (
     }
   });
 });
+test("post-lock revalidation refuses an issuer revoked mid-issue", async () => {
+  await withFreshDatabase(async (pool) => {
+    await runMigrations(pool);
+    const { community, device } = await seedEligibleIssuer(pool, "race");
+
+    const blocker = await pool.connect();
+    const issuer = await pool.connect();
+    try {
+      // Blocker holds the device row: the issue below must pass its
+      // unlocked pre-checks on a valid device, then wait on the
+      // ascending-UUID lock inside the trigger.
+      await blocker.query("BEGIN");
+      await blocker.query(`SELECT 1 FROM credential WHERE id = $1 FOR UPDATE`, [device]);
+      const issuerPid = (await issuer.query(`SELECT pg_backend_pid() AS pid`)).rows[0].pid;
+
+      const attempt = issuer.query(
+        `INSERT INTO pairing_token
+           (issued_by_credential_id, host_public_key, community_id, issued_at, policy_version, expires_at)
+         VALUES ($1, $2, $3, '4000', 1, '604000')`,
+        [device, "f0".repeat(32), community],
+      );
+      // Wait until the issue is blocked on the row lock.
+      const deadline = Date.now() + 10000;
+      for (;;) {
+        const waiting = (await pool.query(
+          `SELECT count(*)::int AS n FROM pg_stat_activity
+           WHERE pid = $1 AND wait_event_type = 'Lock'`, [issuerPid])).rows[0].n;
+        if (waiting === 1) break;
+        if (Date.now() > deadline) throw new Error("issue never reached the row lock");
+        await new Promise((r) => setTimeout(r, 25));
+      }
+
+      // Revoke the device while the issue waits, then release it into the
+      // post-lock revalidation step.
+      await blocker.query(`UPDATE credential SET revoked_at = now() WHERE id = $1`, [device]);
+      await blocker.query("COMMIT");
+
+      await assert.rejects(attempt, (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return message.includes("revoked under lock");
+      });
+      const count = (await pool.query(`SELECT count(*)::int AS n FROM pairing_token`)).rows[0].n;
+      assert.equal(count, 0, "mid-issue revocation must land no row");
+    } finally {
+      blocker.release();
+      issuer.release();
+    }
+  });
+});
+
 test("issued facts are immutable; consume is one-way; delete is refused", async () => {
   await withFreshDatabase(async (pool) => {
     await runMigrations(pool);

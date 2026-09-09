@@ -155,7 +155,10 @@ BEGIN
     RAISE EXCEPTION 'pairing issue refused: cross-person issuer chain';
   END IF;
 
-  -- Lock issuer and root in ascending UUID order, then revalidate under lock.
+  -- Lock issuer and root in ascending UUID order, then revalidate the
+  -- complete issuer relation under lock: existence, kinds, direct
+  -- parent linkage, revocation, and same-person chain. 0006 structural
+  -- immutability already narrows this window; the recheck closes it.
   IF device_row.id < root_row.id THEN
     first_id := device_row.id; second_id := root_row.id;
   ELSE
@@ -164,7 +167,19 @@ BEGIN
   PERFORM 1 FROM credential WHERE id = first_id FOR UPDATE;
   PERFORM 1 FROM credential WHERE id = second_id FOR UPDATE;
   SELECT * INTO device_row FROM credential WHERE id = NEW.issued_by_credential_id;
+  IF device_row.id IS NULL THEN
+    RAISE EXCEPTION 'pairing issue refused: issuer credential vanished under lock';
+  END IF;
+  IF device_row.kind <> 'human' OR device_row.parent_credential_id IS NULL THEN
+    RAISE EXCEPTION 'pairing issue refused: issuer mutated away from human device under lock';
+  END IF;
   SELECT * INTO root_row FROM credential WHERE id = device_row.parent_credential_id;
+  IF root_row.id IS NULL THEN
+    RAISE EXCEPTION 'pairing issue refused: issuer root vanished under lock';
+  END IF;
+  IF root_row.kind <> 'human' OR root_row.parent_credential_id IS NOT NULL THEN
+    RAISE EXCEPTION 'pairing issue refused: issuer root mutated under lock';
+  END IF;
   IF device_row.revoked_at IS NOT NULL OR root_row.revoked_at IS NOT NULL THEN
     RAISE EXCEPTION 'pairing issue refused: issuer revoked under lock';
   END IF;
