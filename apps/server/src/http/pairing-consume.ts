@@ -3,10 +3,11 @@
  *
  * HTTP-only: bounded strict JSON, exact `ConsumeCarrier` shape, then the
  * locked domain command. Public responses are deliberately small:
- * `200 {status:"accepted",requestId}` for an accepted enroll,
- * `400 bad_request` for P1 structural failure, `404 enroll_rejected` for any
- * expected post-P1 refusal, and the existing redacted transport-503 otherwise
- * (including injected audit failure, which rolls back and never collapses).
+ * `200 {status:"enrolled",requestId}` for an accepted enroll,
+ * `400 bad_request` for P1 structural failure, the single fixed
+ * non-disclosure `404 not_found` for any expected post-P1 refusal, and the
+ * existing redacted transport-503 otherwise (including injected audit
+ * failure, which rolls back and never collapses).
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Pool } from "pg";
@@ -100,9 +101,9 @@ export async function handlePairingEnroll(
       return;
     }
     if (!result.ok) {
-      writeEnrollEnvelope(operation, "enroll_rejected");
+      writeEnrollEnvelope(operation, "not_found");
       return;
     }
-    operation.success(200, { status: "accepted", requestId: operation.requestId }, "accepted");
+    operation.success(200, { status: "enrolled", requestId: operation.requestId }, "enrolled");
   });
 }

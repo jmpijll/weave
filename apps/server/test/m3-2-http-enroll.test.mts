@@ -2,8 +2,8 @@
  * Weave M3.2 I4.2 — `POST /v1/hosts/enroll` HTTP response table.
  *
  * Proves P1 structural failures return fixed 400 bad_request, every expected
- * post-P1 refusal collapses to the single fixed 404 enroll_rejected relation,
- * an accepted enroll returns 200 accepted, and no proof/body/key sentinel
+ * post-P1 refusal collapses to the single fixed 404 not_found relation,
+ * an accepted enroll returns 200 enrolled, and no proof/body/key sentinel
  * reaches outcome logs or envelopes.
  */
 import test from "node:test";
@@ -186,7 +186,7 @@ test("P1 failures return fixed 400 bad_request", async () => {
   });
 });
 
-test("accepted enroll returns 200; all expected post-P1 failures collapse to fixed 404", async () => {
+test("accepted enroll returns 200 enrolled; all expected post-P1 failures collapse to fixed 404", async () => {
   await withLiveServer(async ({ base, pool, logs }) => {
     const seed = await seedIssuer(pool);
     const token = await mintToken(pool, seed);
@@ -194,13 +194,13 @@ test("accepted enroll returns 200; all expected post-P1 failures collapse to fix
     const first = await post(base, "/v1/hosts/enroll", { body: JSON.stringify(body) });
     assert.equal(first.status, 200);
     const firstJson = (await first.json()) as { status: string; requestId: string };
-    assert.equal(firstJson.status, "accepted");
+    assert.equal(firstJson.status, "enrolled");
     assert.match(firstJson.requestId, /^[0-9a-f-]{36}$/);
 
     // Replayed consume of the same token: consumed -> fixed 404.
     const replay = await post(base, "/v1/hosts/enroll", { body: JSON.stringify(enrollBody(token, seed.deviceKey, token.hostKey)) });
     assert.equal(replay.status, 404);
-    assert.equal(((await replay.json()) as { error: { code: string; message: string } }).error.code, "enroll_rejected");
+    assert.equal(((await replay.json()) as { error: { code: string; message: string } }).error.code, "not_found");
 
     // Unknown token: fixed 404.
     const ghost = await post(base, "/v1/hosts/enroll", {
@@ -213,7 +213,7 @@ test("accepted enroll returns 200; all expected post-P1 failures collapse to fix
       body: JSON.stringify({ ...body, stableId: randomUUID(), ownerProof: "ab".repeat(64), hostProof: "cd".repeat(64) }),
     });
     assert.equal(badProof.status, 404);
-    assert.equal(((await badProof.json()) as { error: { code: string; message: string } }).error.message, "enrollment was not accepted");
+    assert.equal(((await badProof.json()) as { error: { code: string; message: string } }).error.message, "resource not found");
 
     // No proof/body/key sentinel reaches captured outcome logs or envelopes.
     const blob = JSON.stringify(logs) + JSON.stringify(firstJson);

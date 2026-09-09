@@ -441,6 +441,40 @@ async function awaitRowLock(pool: pg.Pool, pid: unknown): Promise<void> {
   }
 }
 
+test("invalid carrier refuses without acquiring or waiting on the token lock", async () => {
+  await withFreshDatabase(async (pool, connectionString) => {
+    const setup = await issueToken(pool, "nolockwait");
+    const base = validConsumeInput(setup);
+    const invalid = { ...base, ownerProof: "cd".repeat(64) };
+    const consumePool = createDatabasePool(createDatabaseConfig(connectionString, 1));
+    try {
+      const blocker = await pool.connect();
+      try {
+        await blocker.query("BEGIN");
+        await blocker.query(`SELECT 1 FROM pairing_token WHERE id = $1 FOR UPDATE`, [setup.stableId]);
+        // The token lock is held by the blocker for the whole attempt: an
+        // invalid carrier must refuse via the unlocked pre-check instead of
+        // blocking on the lock.
+        const attempt = consumePairingToken(consumePool, invalid, randomUUID());
+        const result = await Promise.race([
+          attempt.then((r) => ({ ...r, waited: false })),
+          new Promise<{ ok: boolean; waited: boolean }>((resolve) =>
+            setTimeout(() => resolve({ ok: false, waited: true }), 3000),
+          ),
+        ]);
+        assert.deepEqual(result, { ok: false, waited: false });
+        await blocker.query("COMMIT");
+      } finally {
+        blocker.release();
+      }
+    } finally {
+      await consumePool.end();
+    }
+    assert.equal(await tokenState(pool, setup.stableId), null);
+    assert.deepEqual(await artifactCounts(pool, setup.stableId), { hostCreds: 0, hosts: 0, audits: 0 });
+  });
+});
+
 test("token-first lock: consume waits on a held token lock then succeeds", async () => {
   await withFreshDatabase(async (pool, connectionString) => {
     const setup = await issueToken(pool, "tokenlock");

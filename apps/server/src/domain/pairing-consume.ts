@@ -10,10 +10,19 @@
  * host key verifies the host-possession proof, and every immutable binding
  * must equal the row.
  *
- * Lock order (deadlock-safe with I4.1 issue): candidate token row
- * `FOR UPDATE` first (serializes competing consumes), then policy `FOR SHARE`,
- * then issuer and root in ascending UUID order `FOR UPDATE`, then the active
- * human member for the stored community last `FOR UPDATE`.
+ * Lock order (deadlock-safe with I4.1 issue): inside the mutation
+ * transaction, the candidate token row `FOR UPDATE` first (serializes
+ * competing consumes), then policy `FOR SHARE`, then issuer and root in
+ * ascending UUID order `FOR UPDATE`, then the active human member for the
+ * stored community last `FOR UPDATE`.
+ *
+ * Stored-row-first sequencing: before the transaction begins, the candidate
+ * row is read unlocked and both proofs are verified against the stored keys
+ * with every immutable binding checked for equality. A structurally valid
+ * but cryptographically invalid carrier therefore refuses without acquiring
+ * or waiting on any lock. The transaction re-reads and revalidates the same
+ * facts and live authority under its locks before consuming, so a row that
+ * changed between the pre-read and the lock acquisition is still refused.
  */
 import type { Pool, PoolClient } from "pg";
 import { buildConsumeRecord, buildHostPossessionRecord } from "@weave/protocol";
@@ -85,12 +94,117 @@ export async function consumePairingToken(
   const consumeFreshness = parseMsText(input.consumeFreshness);
   if (issuedAt === null || consumeFreshness === null) return { ok: false };
 
+  // Stored-row-first pre-check, outside any transaction and without locks:
+  // read the candidate row, check binding equality, and verify both proofs
+  // against the stored keys. Invalid carriers refuse here and never touch
+  // the token/authority locks. Live authority (revocation, membership,
+  // expiry, pending state) is revalidated under lock inside the transaction.
+  const precheck = await precheckConsume(pool, input);
+  if (!precheck.ok) return { ok: false };
+
   return withTransaction(pool, (client) =>
     consumeInTransaction(client, input, consumeFreshness, requestId),
   ).catch((error) => {
     if (error instanceof EnrollAbort) return { ok: false };
     throw error;
   });
+}
+
+interface StoredCandidate {
+  device: string;
+  hostPublic: string;
+  community: string;
+  issuedAt: string;
+  ownerKey: string;
+}
+
+async function readStoredCandidate(pool: Pool, input: ConsumeInput): Promise<StoredCandidate | null> {
+  const token = await pool.query(
+    `SELECT issued_by_credential_id, host_public_key, community_id,
+            issued_at::text AS issued_at, consumed_at
+     FROM pairing_token WHERE id = $1`,
+    [input.stableId],
+  );
+  if (token.rows.length === 0) return null;
+  const row = token.rows[0] as Record<string, unknown>;
+  if (row.consumed_at != null) return null;
+  if (
+    String(row.issued_by_credential_id) !== input.device ||
+    String(row.host_public_key) !== input.hostPublic ||
+    String(row.community_id) !== input.community ||
+    String(row.issued_at) !== input.issuedAt
+  ) {
+    return null;
+  }
+  const deviceRow = await pool.query(
+    `SELECT public_key, kind, algorithm FROM credential WHERE id = $1`,
+    [input.device],
+  );
+  if (deviceRow.rows.length === 0) return null;
+  const device = deviceRow.rows[0] as Record<string, unknown>;
+  if (device.kind !== "human" || device.algorithm !== "ed25519") return null;
+  if (typeof device.public_key !== "string" || !/^[0-9a-f]{64}$/.test(device.public_key)) return null;
+  return {
+    device: input.device,
+    hostPublic: String(row.host_public_key),
+    community: input.community,
+    issuedAt: input.issuedAt,
+    ownerKey: device.public_key,
+  };
+}
+
+function verifyCarrierProofs(input: ConsumeInput, stored: StoredCandidate): boolean {
+  let consumeRecord: Uint8Array;
+  try {
+    consumeRecord = buildConsumeRecord({
+      stableId: input.stableId,
+      hostPublic: stored.hostPublic,
+      community: stored.community,
+      device: stored.device,
+      issuedAt: stored.issuedAt,
+      consumeFreshness: input.consumeFreshness,
+    });
+  } catch {
+    return false;
+  }
+  try {
+    if (
+      !verifyConsume(
+        consumeRecord as Parameters<typeof verifyConsume>[0],
+        input.ownerProof as Parameters<typeof verifyConsume>[1],
+        stored.ownerKey as Parameters<typeof verifyConsume>[2],
+      )
+    ) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  let hostRecord: Uint8Array;
+  try {
+    hostRecord = buildHostPossessionRecord({
+      stableId: input.stableId,
+      hostPublic: stored.hostPublic,
+      issuedAt: stored.issuedAt,
+    });
+  } catch {
+    return false;
+  }
+  try {
+    return verifyHostPossession(
+      hostRecord as Parameters<typeof verifyHostPossession>[0],
+      input.hostProof as Parameters<typeof verifyHostPossession>[1],
+      stored.hostPublic as Parameters<typeof verifyHostPossession>[2],
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function precheckConsume(pool: Pool, input: ConsumeInput): Promise<{ ok: boolean }> {
+  const stored = await readStoredCandidate(pool, input);
+  if (stored === null) return { ok: false };
+  return { ok: verifyCarrierProofs(input, stored) };
 }
 
 async function consumeInTransaction(
@@ -102,8 +216,10 @@ async function consumeInTransaction(
   const refuse = (): ConsumeResult => ({ ok: false });
 
   // 1. Lock the candidate token row FOR UPDATE first: competing consumes
-  //    serialize here. No disclosure — absence, consumed state, or any
-  //    mismatch below all refuse identically.
+  //    serialize here. The unlocked pre-check already passed, but the row is
+  //    re-read and every fact revalidated under this lock, so a row that
+  //    changed in between is refused. No disclosure — absence, consumed
+  //    state, or any mismatch all refuse identically.
   const token = await client.query(
     `SELECT id, issued_by_credential_id, host_public_key, community_id,
             issued_at::text AS issued_at, expires_at::text AS expires_at,
@@ -197,54 +313,23 @@ async function consumeInTransaction(
   const memberRow = member.rows[0] as Record<string, unknown>;
   const memberId = String(memberRow.id);
 
-  // 4. Verify both proofs under the stored keys: the owner consume proof
-  //    against the consume record, the host proof against the host-possession
-  //    record, keyed by the stored host identity — never a caller key.
-  let consumeRecord: Uint8Array;
-  try {
-    consumeRecord = buildConsumeRecord({
-      stableId: input.stableId,
+  // 4. Revalidate both proofs under the stored keys (same check as the
+  //    unlocked pre-read, now against the locked row facts and the locked
+  //    device key): the owner consume proof against the consume record, the
+  //    host proof against the host-possession record keyed by the stored host
+  //    identity — never a caller key. A row that changed between the
+  //    pre-read and these locks is refused here.
+  if (
+    !verifyCarrierProofs(input, {
+      device: input.device,
       hostPublic: storedHostKey,
       community: input.community,
-      device: input.device,
       issuedAt: input.issuedAt,
-      consumeFreshness: input.consumeFreshness,
-    });
-  } catch {
+      ownerKey,
+    })
+  ) {
     return refuse();
   }
-  let ownerVerified = false;
-  try {
-    ownerVerified = verifyConsume(
-      consumeRecord as Parameters<typeof verifyConsume>[0],
-      input.ownerProof as Parameters<typeof verifyConsume>[1],
-      ownerKey as Parameters<typeof verifyConsume>[2],
-    );
-  } catch {
-    return refuse();
-  }
-  if (!ownerVerified) return refuse();
-  let hostRecord: Uint8Array;
-  try {
-    hostRecord = buildHostPossessionRecord({
-      stableId: input.stableId,
-      hostPublic: storedHostKey,
-      issuedAt: input.issuedAt,
-    });
-  } catch {
-    return refuse();
-  }
-  let hostVerified = false;
-  try {
-    hostVerified = verifyHostPossession(
-      hostRecord as Parameters<typeof verifyHostPossession>[0],
-      input.hostProof as Parameters<typeof verifyHostPossession>[1],
-      storedHostKey as Parameters<typeof verifyHostPossession>[2],
-    );
-  } catch {
-    return refuse();
-  }
-  if (!hostVerified) return refuse();
 
   // 5. Sample one post-lock DB wall clock as text decimal ms, validate its
   //    range, enforce consume freshness edges with BigInt, and consume only a

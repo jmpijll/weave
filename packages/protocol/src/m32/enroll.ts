@@ -5,7 +5,8 @@
  * `ConsumeCarrier` member set; the error registry is route-specific and
  * versioned, and must not extend `RecoveryErrorCode` or the issue registry.
  * P1 structural failures map to `bad_request` (400); every expected post-P1
- * failure collapses to the single `enroll_rejected` (404) relation.
+ * failure collapses to the single fixed non-disclosure `not_found` (404)
+ * relation.
  */
 import type { ConsumeCarrier } from "./carrier.ts";
 
@@ -13,7 +14,7 @@ export type PairingEnrollRequest = ConsumeCarrier;
 
 export const PAIRING_ENROLL_ROUTE = "/v1/hosts/enroll" as const;
 
-export type EnrollErrorCode = "bad_request" | "enroll_rejected";
+export type EnrollErrorCode = "bad_request" | "not_found";
 
 export interface EnrollErrorDescriptor {
   status: 400 | 404;
@@ -29,9 +30,9 @@ const ENROLL_ERRORS: Record<EnrollErrorCode, EnrollErrorDescriptor> = {
     retryable: true,
     family: "structural",
   },
-  enroll_rejected: {
+  not_found: {
     status: 404,
-    message: "enrollment was not accepted",
+    message: "resource not found",
     retryable: false,
     family: "authorization",
   },
@@ -43,5 +44,5 @@ export function resolveEnrollError(code: EnrollErrorCode): EnrollErrorDescriptor
 
 export const ENROLL_ERROR_MESSAGE: Record<EnrollErrorCode, string> = {
   bad_request: ENROLL_ERRORS.bad_request.message,
-  enroll_rejected: ENROLL_ERRORS.enroll_rejected.message,
+  not_found: ENROLL_ERRORS.not_found.message,
 };
