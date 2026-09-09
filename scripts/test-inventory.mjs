@@ -3,7 +3,7 @@
  * Single reviewed test inventory for Weave.
  *
  * The package `test` command invokes exactly this module once. It is the sole
- * place that names the fifteen existing test layers, so the T4 and T9 command
+ * place that names the sixteen existing test layers, so the T4 and T9 command
  * strings can no longer drift apart:
  *
  *   1. verify-workspaces.mjs            workspace wiring (protocol dependency,
@@ -48,11 +48,18 @@
  *                                      bindings, widened epoch-bump
  *                                      predicates, space_membership DELETE
  *                                      blocked (node:test; needs DATABASE_URL)
- *  15. m32-i1-pure-protocol.test.mts  M3.2-I1 pure-protocol candidate
- *                                      records for issuance/host/consume:
- *                                      TLV framing, grammar, carrier mapping,
- *                                      and Ed25519 verifier handoff
- *                                      (node:test; no database required)
+  *  15. m32-i1-pure-protocol.test.mts  M3.2-I1 pure-protocol candidate
+  *                                      records for issuance/host/consume:
+  *                                      TLV framing, grammar, carrier mapping,
+  *                                      and Ed25519 verifier handoff
+  *                                      (node:test; no database required)
+  *  16. m3-2-persistence.test.mts       M3.2-I2 pairing relational substrate:
+  *                                      immutable policy registry, exact
+  *                                      bigint lifecycle times, raw-insert
+  *                                      issuer/derivation backstop, immutable
+  *                                      facts, one-way consume, delete
+  *                                      refusal (node:test; needs
+  *                                      DATABASE_URL)
  *
  * Each layer runs as its own child process with the pinned `node` binary
  * (process.execPath), so a failure is isolated and attributable. A non-zero
@@ -80,6 +87,7 @@ const INVENTORY = [
   { name: "m3-1-enrollment-schema.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-1-enrollment-schema.test.mts"] },
   { name: "m2-2a-covering-set.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m2-2a-covering-set.test.mts"] },
   { name: "m32-i1-pure-protocol.test.mts", args: ["--experimental-strip-types", "--test", "packages/protocol/test/m32-i1.test.mts"] },
+  { name: "m3-2-persistence.test.mts", args: ["--experimental-strip-types", "--test", "apps/server/test/m3-2-persistence.test.mts"] },
 ];
 
 let failed = 0;
